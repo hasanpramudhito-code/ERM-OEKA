@@ -1047,7 +1047,7 @@ const EnhancedNavigation = ({ mobileOpen, onDrawerToggle }) => {
     console.log('No currentUser found, but continuing to show navigation');
     // return null; // ← COMMENT LINE INI
   }
-  const sidebarGradient = 'linear-gradient(195deg, #1a237e 0%, #283593 25%, #303f9f 50%, #3949ab 75%, #5c6bc0 100%)';
+  const sidebarGradient = 'linear-gradient(195deg, #22c55e 0%, #16a34a 50%, #15803d 100%)';
 
   const drawerContent = (
     <>
