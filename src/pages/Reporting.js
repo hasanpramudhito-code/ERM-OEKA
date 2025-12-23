@@ -243,7 +243,6 @@ const Reporting = () => {
     }
   };
 
-  // ======== EXPORT: RISK REGISTER – PDF (landscape, grouped header) ========
 
 // ======== EXPORT: RISK REGISTER – PDF (final: huruf kecil, +skala L/I & existing) ========
 const exportRiskRegisterPDF = async (filteredRisks) => {
@@ -268,7 +267,7 @@ const exportRiskRegisterPDF = async (filteredRisks) => {
 
   doc.setTextColor(255);
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(13); // ===== Judul 13 pt =====
+  doc.setFontSize(11); // ===== Judul 13 pt =====
   doc.text('RISK REGISTER', page.w / 2, 30, { align: 'center' });
 
   doc.setFont('helvetica', 'normal');
@@ -405,7 +404,7 @@ const exportRiskRegisterPDF = async (filteredRisks) => {
     theme: 'grid',
     styles: {
       font: 'helvetica',
-      fontSize: 6, // ===== Isi tabel 6 pt =====
+      fontSize: 4, // ===== Isi tabel 6 pt =====
       cellPadding: { top: 2, right: 2, bottom: 2, left: 2 },
       lineColor: 225,
       textColor: 33,
@@ -413,7 +412,7 @@ const exportRiskRegisterPDF = async (filteredRisks) => {
       overflow: 'linebreak', // wrap teks panjang
     },
     headStyles: {
-      fontSize: 6, // ===== Header tabel 6 pt =====
+      fontSize: 4, // ===== Header tabel 6 pt =====
       fontStyle: 'bold',
       fillColor: [245, 247, 250],
       textColor: 33,
@@ -454,7 +453,7 @@ const exportRiskRegisterPDF = async (filteredRisks) => {
     didDrawPage: () => {
       // Footer 6 pt
       const str = `Halaman ${doc.getCurrentPageInfo().pageNumber} dari ${doc.internal.getNumberOfPages()} • Generated ${nowStr}`;
-      doc.setFontSize(6);
+      doc.setFontSize(4);
       doc.setTextColor(120);
       doc.text(str, page.w / 2, page.h - 12, { align: 'center' });
     },
