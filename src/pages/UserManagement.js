@@ -26,25 +26,26 @@ import {
   Alert,
   Snackbar
 } from '@mui/material';
-import { 
-  Add, 
-  Edit, 
-  Delete, 
-  Person, 
-  Email, 
+import {
+  Add,
+  Edit,
+  Delete,
+  Person,
+  Email,
   Business,
-  Badge 
+  Badge
 } from '@mui/icons-material';
-import { 
-  collection, 
-  getDocs, 
-  doc, 
-  updateDoc, 
+import {
+  collection,
+  getDocs,
+  doc,
+  updateDoc,
   deleteDoc,
-  setDoc // ← UBAH: setDoc menggantikan addDoc
+  setDoc
 } from 'firebase/firestore';
-import { 
-  createUserWithEmailAndPassword
+import {
+  createUserWithEmailAndPassword,
+  signOut
 } from 'firebase/auth';
 
 import { db, auth } from '../config/firebase';
@@ -86,27 +87,30 @@ const UserManagement = () => {
       usersSnapshot.forEach((doc) => {
         const data = doc.data();
         
-        // CREATE USER OBJECT WITH GUARANTEED uid
         const userObj = {
           id: doc.id,
-          // uid MUTLAK harus ada: dari data.uid, atau dari id
-          uid: data.uid || doc.id, // ← INI YANG PENTING!
+          uid: data.uid || doc.id,
           ...data,
           role: normalizeRole(data.role)
         };
-        
-        console.log('Loaded user:', { 
-          id: userObj.id, 
-          uid: userObj.uid, 
-          name: userObj.name 
-        });
         
         usersList.push(userObj);
       });
       
       setUsers(usersList);
       
-      // Load organization units...
+      // Load organization units
+      try {
+        const unitsSnapshot = await getDocs(collection(db, 'organizationUnits'));
+        const unitsList = [];
+        unitsSnapshot.forEach((doc) => {
+          unitsList.push({ id: doc.id, ...doc.data() });
+        });
+        setOrganizationUnits(unitsList);
+      } catch (unitsError) {
+        console.warn('Could not load organization units:', unitsError);
+      }
+      
     } catch (error) {
       console.error('Error loading data:', error);
       setError('Gagal memuat data');
@@ -119,6 +123,7 @@ const UserManagement = () => {
     loadData();
   }, []);
 
+  // ========== SIMPLE FRONTEND SOLUTION ==========
   const handleSubmit = async (e) => {
     e.preventDefault();
     setLoading(true);
@@ -128,8 +133,8 @@ const UserManagement = () => {
       const upperRole = normalizeRole(formData.role);
 
       if (editingUser) {
-        // Update user - GUNAKAN uid sebagai document ID
-        await updateDoc(doc(db, 'users', editingUser.uid), { // ← UBAH: editingUser.uid
+        // UPDATE USER (Firestore only)
+        await updateDoc(doc(db, 'users', editingUser.id), {
           name: formData.name,
           role: upperRole,
           department: formData.department,
@@ -140,16 +145,37 @@ const UserManagement = () => {
           updatedAt: new Date(),
           updatedBy: userData?.name || 'System'
         });
+        
         setSuccess('User berhasil diupdate!');
+        
       } else {
+        // CREATE NEW USER (SIMPLE VERSION)
+        
+        // Tampilkan warning bahwa admin akan logout
+        const confirmCreate = window.confirm(
+          'PERHATIAN: Setelah membuat user baru, Anda akan logout sementara.\n' +
+          'Silakan login kembali sebagai admin setelah proses selesai.\n\n' +
+          'Lanjutkan membuat user?'
+        );
+        
+        if (!confirmCreate) {
+          setLoading(false);
+          return;
+        }
+
+        // 1. Simpan admin email untuk info
+        const adminEmail = userData?.email;
+        
+        // 2. Create user (akan auto-login sebagai user baru)
         const userCredential = await createUserWithEmailAndPassword(
-          auth, 
-          formData.email, 
+          auth,
+          formData.email,
           formData.password
         );
         
-        // BUAT DOCUMENT DENGAN UID SEBAGAI DOCUMENT ID
+        // 3. Save to Firestore
         await setDoc(doc(db, "users", userCredential.user.uid), {
+          uid: userCredential.user.uid,
           name: formData.name,
           email: formData.email,
           role: upperRole,
@@ -161,9 +187,26 @@ const UserManagement = () => {
           createdAt: new Date(),
           createdBy: userData?.name || 'System'
         });
-        setSuccess('User berhasil ditambahkan!');
+        
+        // 4. Logout user baru
+        await signOut(auth);
+        
+        // 5. Show success message with instructions
+        alert(
+          `User "${formData.name}" berhasil dibuat!\n\n` +
+          `Email: ${formData.email}\n` +
+          `Password: ${formData.password}\n\n` +
+          'Silakan login kembali sebagai admin.\n' +
+          `Email admin: ${adminEmail}`
+        );
+        
+        // 6. Redirect to login page
+        window.location.href = '/login';
+        
+        return; // Stop execution
       }
 
+      // Cleanup untuk update case
       setOpenDialog(false);
       setEditingUser(null);
       setFormData({
@@ -178,66 +221,57 @@ const UserManagement = () => {
         status: 'active'
       });
 
+      // Refresh data
       loadData();
       
     } catch (error) {
       console.error('Error saving user:', error);
-      setError('Gagal menyimpan user: ' + error.message);
+      
+      // Handle common Firebase errors
+      if (error.code === 'auth/email-already-in-use') {
+        setError('Email sudah digunakan oleh user lain');
+      } else if (error.code === 'auth/weak-password') {
+        setError('Password terlalu lemah (minimal 6 karakter)');
+      } else if (error.code === 'auth/invalid-email') {
+        setError('Format email tidak valid');
+      } else {
+        setError('Gagal menyimpan user: ' + error.message);
+      }
     } finally {
       setLoading(false);
     }
-  }; // ← TAMBAH: kurung tutup yang hilang
+  };
 
+  // ========== HANDLE DELETE (Nonaktifkan saja) ==========
   const handleDelete = async (user) => {
-    console.log('DELETE - User:', {
-      name: user.name,
-      firestoreDocId: user.id,      // ← Document ID di Firestore
-      authUid: user.uid,           // ← UID di Authentication
-      areTheySame: user.id === user.uid
-    });
-    
-    if (window.confirm(`Hapus user ${user.name}?`)) {
-      try {
-        // GUNAKAN user.id (Firestore Document ID)
-        await deleteDoc(doc(db, 'users', user.id));
-        
-        console.log(`Deleted user ${user.name} with Firestore ID: ${user.id}`);
-        setSuccess('User berhasil dihapus!');
-        
-        // Refresh data
-        loadData();
-        
-      } catch (error) {
-        console.error('Delete error:', error);
-        
-        // Jika gagal dengan id, coba dengan uid
-        if (user.uid && user.uid !== user.id) {
-          console.log('Trying with UID instead...');
-          try {
-            await deleteDoc(doc(db, 'users', user.uid));
-            setSuccess('User berhasil dihapus (using UID)!');
-            loadData();
-          } catch (uidError) {
-            setError('Gagal menghapus dengan UID juga: ' + uidError.message);
-          }
-        } else {
-          setError('Gagal menghapus user: ' + error.message);
-        }
-      }
+    if (!window.confirm(`Nonaktifkan user ${user.name}? User tidak akan bisa login.`)) {
+      return;
+    }
+
+    try {
+      // Hanya nonaktifkan, jangan hapus dari auth
+      await updateDoc(doc(db, 'users', user.id), {
+        status: 'inactive',
+        updatedAt: new Date(),
+        updatedBy: userData?.name || 'System'
+      });
+      
+      setSuccess('User dinonaktifkan!');
+      loadData();
+      
+    } catch (error) {
+      console.error('Error deactivating user:', error);
+      setError('Gagal menonaktifkan user: ' + error.message);
     }
   };
 
+  // ========== HANDLE EDIT ==========
   const handleEdit = (user) => {
-    setEditingUser({
-      ...user,
-      // PASTIKAN uid ada
-      uid: user.uid || user.id || '' // ← Tambah ini
-    });
-    
+    setEditingUser(user);
     setFormData({
       name: user.name || '',
       email: user.email || '',
-      password: '',
+      password: '', // Kosongkan password untuk edit
       role: user.role || '',
       department: user.department || '',
       position: user.position || '',
@@ -245,10 +279,10 @@ const UserManagement = () => {
       phone: user.phone || '',
       status: user.status || 'active'
     });
-    
     setOpenDialog(true);
   };
 
+  // ========== HELPER FUNCTIONS ==========
   const getRoleColor = (role) => {
     const r = normalizeRole(role);
     switch (r) {
@@ -286,6 +320,7 @@ const UserManagement = () => {
     });
   };
 
+  // ========== STATISTICS ==========
   const userStats = {
     total: users.length,
     active: users.filter(u => u.status === 'active').length,
@@ -295,6 +330,7 @@ const UserManagement = () => {
 
   const isAdmin = normalizeRole(userData?.role) === 'ADMIN';
 
+  // ========== RENDER ==========
   return (
     <Box sx={{ p: 3 }}>
       {/* Header */}
@@ -306,6 +342,9 @@ const UserManagement = () => {
             <Typography variant="subtitle1" color="textSecondary">
               Kelola user dan hak akses sistem
             </Typography>
+            <Typography variant="caption" color="warning.main">
+              Catatan: Untuk tambah user baru, Anda akan logout sementara
+            </Typography>
           </Box>
         </Box>
         
@@ -314,20 +353,24 @@ const UserManagement = () => {
           startIcon={<Add />}
           onClick={() => setOpenDialog(true)}
           disabled={!isAdmin}
-          sx={{ minWidth: 140, opacity: isAdmin ? 1 : 0.6 }}
+          sx={{ 
+            minWidth: 140, 
+            opacity: isAdmin ? 1 : 0.6,
+            position: 'relative'
+          }}
         >
           Tambah User
           {!isAdmin && (
             <Typography 
               variant="caption"
-              display="block"
               sx={{
                 position: 'absolute',
                 bottom: -20,
                 left: 0,
                 right: 0,
                 textAlign: 'center',
-                color: 'text.secondary'
+                color: 'text.secondary',
+                whiteSpace: 'nowrap'
               }}
             >
               (Hanya Admin)
@@ -343,16 +386,11 @@ const UserManagement = () => {
         </Alert>
       )}
 
-      <Snackbar
-        open={!!success}
-        autoHideDuration={4000}
-        onClose={() => setSuccess('')}
-        anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
-      >
-        <Alert onClose={() => setSuccess('')} severity="success" sx={{ width: '100%' }}>
+      {success && (
+        <Alert severity="success" sx={{ mb: 3 }} onClose={() => setSuccess('')}>
           {success}
         </Alert>
-      </Snackbar>
+      )}
 
       {/* Stats */}
       <Grid container spacing={3} sx={{ mb: 4 }}>
@@ -431,6 +469,12 @@ const UserManagement = () => {
           <Box textAlign="center" py={4}>
             <Typography>Memuat data user...</Typography>
           </Box>
+        ) : users.length === 0 ? (
+          <Box textAlign="center" py={4}>
+            <Typography color="textSecondary">
+              Belum ada user. Klik "Tambah User" untuk menambahkan.
+            </Typography>
+          </Box>
         ) : (
           <TableContainer>
             <Table>
@@ -473,7 +517,7 @@ const UserManagement = () => {
                       />
                     </TableCell>
 
-                    <TableCell>{user.department}</TableCell>
+                    <TableCell>{user.department || '-'}</TableCell>
                     <TableCell>{getUnitName(user.unitId)}</TableCell>
 
                     <TableCell>
@@ -490,6 +534,7 @@ const UserManagement = () => {
                         color="primary"
                         size="small"
                         disabled={!isAdmin}
+                        title="Edit User"
                       >
                         <Edit />
                       </IconButton>
@@ -499,6 +544,7 @@ const UserManagement = () => {
                         color="error"
                         size="small"
                         disabled={!isAdmin}
+                        title="Nonaktifkan User"
                       >
                         <Delete />
                       </IconButton>
@@ -513,7 +559,12 @@ const UserManagement = () => {
       </Paper>
 
       {/* Add/Edit User Dialog */}
-      <Dialog open={openDialog} onClose={handleCloseDialog} maxWidth="md" fullWidth>
+      <Dialog 
+        open={openDialog} 
+        onClose={handleCloseDialog} 
+        maxWidth="md" 
+        fullWidth
+      >
         <DialogTitle>
           {editingUser ? 'Edit User' : 'Tambah User Baru'}
         </DialogTitle>
@@ -555,7 +606,7 @@ const UserManagement = () => {
                   onChange={(e) => setFormData({ ...formData, password: e.target.value })}
                   margin="normal"
                   required={!editingUser}
-                  helperText={editingUser ? 'Kosongkan jika tidak ingin mengubah password' : ''}
+                  helperText={editingUser ? 'Kosongkan jika tidak ingin mengubah password' : 'Minimal 6 karakter'}
                 />
               </Grid>
 
@@ -577,11 +628,11 @@ const UserManagement = () => {
                     label="Role"
                     onChange={(e) => setFormData({ ...formData, role: e.target.value })}
                   >
-                  {Object.keys(ROLES).map((roleKey) => (
-                    <MenuItem key={roleKey} value={roleKey}>
-                      {ROLES[roleKey].name}
-                    </MenuItem>
-                  ))}
+                    {Object.keys(ROLES).map((roleKey) => (
+                      <MenuItem key={roleKey} value={roleKey}>
+                        {ROLES[roleKey].name}
+                      </MenuItem>
+                    ))}
                   </Select>
                 </FormControl>
               </Grid>

@@ -1,671 +1,1150 @@
-import React, { useState, useEffect } from 'react';
+
+// src/pages/Reporting.js
+// -------------------------------------------------------------
+// Reporting + Export PDF, Excel (.xlsx), Word (.docx), Text (.txt)
+// Tipe: executive_summary, risk_register, treatment_progress, incident_report, comprehensive
+// - Risk Register: kolom sesuai header Ibu (Inheren & Residual + nilai dampak Rp).
+// - Skor mengikuti konfigurasi (coordinate/multiply) via AssessmentConfigContext.
+// - FIX: skor SELALU dihitung via konfigurasi (pakai calculateScore jika ada).
+// - FIX: PDF Risk Register rapi (grouped header 2 tingkat, wrap teks, lebar kolom).
+// - FIX: saveAs di-import sekali di top-level.
+// -------------------------------------------------------------
+
+import React, { useEffect, useState } from 'react';
 import {
-  Box,
-  Grid,
-  Card,
-  CardContent,
-  Typography,
-  Button,
-  FormControl,
-  InputLabel,
-  Select,
-  MenuItem,
-  Paper,
-  Table,
-  TableBody,
-  TableCell,
-  TableContainer,
-  TableHead,
-  TableRow,
-  Chip,
-  LinearProgress,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogActions,
-  TextField,
-  Alert,
-  Snackbar,
-  CircularProgress
+  Box, Grid, Card, CardContent, Typography, Button, FormControl, InputLabel, Select, MenuItem,
+  Paper, Table, TableBody, TableCell, TableContainer, TableHead, TableRow,
+  Alert, Snackbar, CircularProgress, Chip, Dialog, DialogTitle, DialogContent, DialogActions, TextField
 } from '@mui/material';
-import {
-  PictureAsPdf,
-  TableChart,
-  Download,
-  Schedule,
-  Assignment,
-  Warning,
-  Analytics
-} from '@mui/icons-material';
-import { collection, getDocs, query, orderBy, where } from 'firebase/firestore';
+import { PictureAsPdf, TableChart, Schedule, Warning, Assignment, Analytics } from '@mui/icons-material';
+import { collection, getDocs, query } from 'firebase/firestore';
 import { db } from '../config/firebase';
 import { useAuth } from '../contexts/AuthContext';
+import { useAssessmentConfig } from '../contexts/AssessmentConfigContext';
+import { saveAs } from 'file-saver'; // ✅ import sekali
+
+// (opsional) logo perusahaan base64 untuk PDF/Word/Excel
+const LOGO_BASE64 = ''; // contoh: 'data:image/png;base64,iVBORw0K...'
 
 const Reporting = () => {
+  const { userData } = useAuth();
+
+  // ======== STATE ========
   const [risks, setRisks] = useState([]);
   const [treatmentPlans, setTreatmentPlans] = useState([]);
   const [incidents, setIncidents] = useState([]);
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
-  const [scheduleDialog, setScheduleDialog] = useState(false);
   const [snackbar, setSnackbar] = useState({ open: false, message: '', severity: 'success' });
-  const { userData } = useAuth();
+  const [scheduleDialog, setScheduleDialog] = useState(false);
 
   const [reportConfig, setReportConfig] = useState({
-    reportType: 'executive_summary',
-    format: 'pdf',
+    reportType: 'executive_summary', // 'executive_summary' | 'risk_register' | 'treatment_progress' | 'incident_report' | 'comprehensive'
+    format: 'pdf',                   // 'pdf' | 'excel' | 'word' | 'text'
     dateRange: 'all_time',
-    department: 'all',
     riskLevel: 'all',
-    includeCharts: true
   });
 
-  const [scheduleConfig, setScheduleConfig] = useState({
-    frequency: 'monthly',
-    recipients: '',
-    reportType: 'executive_summary',
-    format: 'pdf'
-  });
+  // ======== ASSESSMENT CONFIG (score/level) ========
+  const {
+    config: assessmentConfig,
+    calculateScore,
+    calculateRiskLevel,
+  } = useAssessmentConfig();
 
-  // Report types
-  const reportTypes = [
-    { value: 'executive_summary', label: 'Executive Summary', icon: <Analytics /> },
-    { value: 'risk_register', label: 'Risk Register', icon: <Warning /> },
-    { value: 'treatment_progress', label: 'Treatment Progress', icon: <Assignment /> },
-    { value: 'incident_report', label: 'Incident Report', icon: <Warning /> },
-    { value: 'comprehensive', label: 'Comprehensive Report', icon: <TableChart /> }
-  ];
+  // ======== HELPERS ========
+  const toDate  = (t) => (t?.toDate ? t.toDate() : (t ? new Date(t) : null));
+  const fmtDate = (d) => (d ? new Date(d).toLocaleDateString('id-ID') : '-');
 
-  // Date ranges
-  const dateRanges = [
-    { value: 'last_week', label: 'Minggu Lalu' },
-    { value: 'last_month', label: 'Bulan Lalu' },
-    { value: 'last_quarter', label: 'Kuartal Lalu' },
-    { value: 'last_year', label: 'Tahun Lalu' },
-    { value: 'all_time', label: 'Semua Data' }
-  ];
+  // ⚠️ Wajib: skor dan level mengikuti konfigurasi koordinat jika fungsi tersedia.
+  const scoreByConfig = (L, I) => {
+    const l = Number(L);
+    const p = Number(I);
+    const ln = Number.isFinite(l) ? l : 0;
+    const pn = Number.isFinite(p) ? p : 0;
 
-  // Helper function to convert Firebase timestamp to Date
-  const convertFirebaseTimestamp = (timestamp) => {
-    if (!timestamp) return new Date();
-    if (timestamp.toDate) {
-      return timestamp.toDate();
+    if (typeof calculateScore === 'function') {
+      try {
+        const s = calculateScore(ln, pn);
+        if (Number.isFinite(Number(s))) return Number(s);
+      } catch (e) {
+        console.warn('[scoreByConfig] calculateScore error:', e);
+      }
     }
-    return new Date(timestamp);
+    // fallback multiply
+    return ln * pn;
   };
 
-  // Load data untuk reporting
+  const levelByConfig = (s) => {
+    const val = Number(s);
+    const sv  = Number.isFinite(val) ? val : 0;
+
+    if (typeof calculateRiskLevel === 'function') {
+      try {
+        const lvl = calculateRiskLevel(sv);
+        // bisa string atau object {level, score, color}
+        if (lvl && (typeof lvl === 'string' || lvl.level)) {
+          return typeof lvl === 'string' ? { level: lvl, score: sv } : { ...lvl, score: sv };
+        }
+      } catch (e) {
+        console.warn('[levelByConfig] calculateRiskLevel error:', e);
+      }
+    }
+    // fallback sederhana
+    return { level: sv >= 20 ? 'Extreme' : sv >= 16 ? 'High' : sv >= 10 ? 'Medium' : 'Low', score: sv };
+  };
+
+  const fmtRp = (v) => {
+    if (v === null || v === undefined || v === '') return '-';
+    const num = Number(v);
+    return Number.isFinite(num) ? ('Rp ' + num.toLocaleString('id-ID')) : String(v);
+  };
+
+  const showSnackbar = (message, severity) => setSnackbar({ open: true, message, severity });
+  const handleCloseSnackbar = () => setSnackbar({ ...snackbar, open: false });
+
+  // ======== LOAD DATA ========
   const loadData = async () => {
     try {
       setLoading(true);
-      console.log('🔄 Loading report data from Firebase...');
-      
-      // Load risks
-      const risksQuery = query(collection(db, 'risks'));
-      const risksSnapshot = await getDocs(risksQuery);
+
+      // risks
+      const risksSnapshot = await getDocs(query(collection(db, 'risks')));
       const risksList = [];
       risksSnapshot.forEach((doc) => {
         const data = doc.data();
-        risksList.push({ 
-          id: doc.id, 
-          ...data,
-          likelihood: data.likelihood || 1,
-          impact: data.impact || 1,
-          classification: data.classification || 'Uncategorized',
-          riskOwner: data.riskOwner || '',
-          title: data.title || data.riskDescription || 'Unnamed Risk',
-          riskDescription: data.riskDescription || data.title || 'No description',
-          riskCode: data.riskCode || '',
-          department: data.department || '',
-          riskType: data.riskType || '',
-          riskSource: data.riskSource || '',
-          cause: data.cause || '',
-          effect: data.effect || '',
-          existingControl: data.existingControl || '',
-          status: data.status || 'Identified',
-          progress: data.progress || 0,
-          comments: data.comments || '',
-          createdBy: data.createdBy || '',
-          identificationDate: convertFirebaseTimestamp(data.identificationDate),
-          targetDate: convertFirebaseTimestamp(data.targetDate),
-          createdAt: convertFirebaseTimestamp(data.createdAt),
-          updatedAt: convertFirebaseTimestamp(data.updatedAt)
+        risksList.push({
+          id: doc.id,
+          // identitas & deskripsi
+          riskCode: data.riskCode ?? '',
+          riskType: data.riskType ?? '',
+          riskSource: data.riskSource ?? '',
+          department: data.department ?? '',
+          title: data.title ?? data.riskDescription ?? '',
+          riskDescription: data.riskDescription ?? data.title ?? '',
+          cause: data.cause ?? '',
+          effect: data.effect ?? data.impactText ?? '',        // ✅ normalisasi dampak teks
+          riskOwner: data.riskOwner ?? '',
+          responsiblePerson: data.responsiblePerson ?? '',
+          status: data.status ?? 'Identified',
+          comments: data.comments ?? '',
+          progress: data.progress ?? 0,
+
+          // preview L/I terkini (kalau ada)
+          likelihood: data.likelihood ?? '',
+          impact: data.impact ?? '',
+
+          // timeline
+          identificationDate: toDate(data.identificationDate),
+          targetDate: toDate(data.targetDate),
+          createdAt: toDate(data.createdAt),
+          updatedAt: toDate(data.updatedAt),
+
+          // skala awal/inheren
+          initialProbability: data.initialProbability ?? '',
+          initialImpact: data.initialImpact ?? '',
+
+          // skala residual
+          residualProbability: data.residualProbability ?? '',
+          residualImpact: data.residualImpact ?? '',
+
+          // KUANTIFIKASI (RUPIAH)
+          inherentRiskQuantification: data.inherentRiskQuantification ?? '',
+          residualRiskQuantification: data.residualRiskQuantification ?? '',
+
+          // kontrol
+          existingControl: data.existingControl ?? data.existingControls ?? '', // ✅ normalisasi agar tidak kosong
+          additionalControls: data.additionalControls ?? '',
+          controlEffectiveness: data.controlEffectiveness ?? '',
+          controlCost: data.controlCost ?? '',
         });
       });
-      console.log('✅ Loaded risks:', risksList.length);
       setRisks(risksList);
 
-      // Load treatment plans
-      const plansQuery = query(collection(db, 'treatment_plans'));
-      const plansSnapshot = await getDocs(plansQuery);
+      // treatment_plans
+      const plansSnapshot = await getDocs(query(collection(db, 'treatment_plans')));
       const plansList = [];
       plansSnapshot.forEach((doc) => {
         const data = doc.data();
-        plansList.push({ 
-          id: doc.id, 
-          ...data,
-          progress: data.progress || 0,
-          status: data.status || 'planned',
-          responsiblePerson: data.responsiblePerson || '',
-          treatmentDescription: data.treatmentDescription || 'No description',
-          treatmentType: data.treatmentType || 'mitigation',
-          createdAt: convertFirebaseTimestamp(data.createdAt)
+        plansList.push({
+          id: doc.id,
+          progress: data.progress ?? 0,
+          status: data.status ?? 'planned',
+          responsiblePerson: data.responsiblePerson ?? '',
+          treatmentDescription: data.treatmentDescription ?? 'No description',
+          treatmentType: data.treatmentType ?? 'mitigation',
+          createdAt: toDate(data.createdAt),
         });
       });
-      console.log('✅ Loaded treatment plans:', plansList.length);
       setTreatmentPlans(plansList);
 
-      // Load incidents
-      const incidentsQuery = query(collection(db, 'incidents'));
-      const incidentsSnapshot = await getDocs(incidentsQuery);
+      // incidents
+      const incidentsSnapshot = await getDocs(query(collection(db, 'incidents')));
       const incidentsList = [];
       incidentsSnapshot.forEach((doc) => {
         const data = doc.data();
-        incidentsList.push({ 
-          id: doc.id, 
-          ...data,
-          severity: data.severity || 'medium',
-          status: data.status || 'reported',
-          description: data.description || 'No description',
-          reportedBy: data.reportedBy || '',
-          incidentDate: convertFirebaseTimestamp(data.incidentDate),
-          createdAt: convertFirebaseTimestamp(data.createdAt)
+        incidentsList.push({
+          id: doc.id,
+          severity: data.severity ?? 'medium',
+          status: data.status ?? 'reported',
+          description: data.description ?? 'No description',
+          reportedBy: data.reportedBy ?? '',
+          incidentDate: toDate(data.incidentDate),
+          createdAt: toDate(data.createdAt),
         });
       });
-      console.log('✅ Loaded incidents:', incidentsList.length);
       setIncidents(incidentsList);
 
       showSnackbar('Data berhasil dimuat!', 'success');
     } catch (error) {
-      console.error('❌ Error loading report data:', error);
+      console.error(error);
       showSnackbar('Error memuat data laporan: ' + error.message, 'error');
     } finally {
       setLoading(false);
     }
   };
+  useEffect(() => { loadData(); }, []);
 
-  useEffect(() => {
-    loadData();
-  }, []);
-
-  // Filter data berdasarkan config
+  // ======== FILTER ========
   const getFilteredData = () => {
     try {
       let filteredRisks = [...risks];
       let filteredTreatments = [...treatmentPlans];
       let filteredIncidents = [...incidents];
 
-      // Filter by date range
       const now = new Date();
-      let startDate = new Date(0); // Default: all time
-
+      let startDate = new Date(0);
       switch (reportConfig.dateRange) {
-        case 'last_week':
-          startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-          break;
-        case 'last_month':
-          startDate = new Date(now.getFullYear(), now.getMonth() - 1, now.getDate());
-          break;
-        case 'last_quarter':
-          startDate = new Date(now.getFullYear(), now.getMonth() - 3, now.getDate());
-          break;
-        case 'last_year':
-          startDate = new Date(now.getFullYear() - 1, now.getMonth(), now.getDate());
-          break;
-        case 'all_time':
-        default:
-          startDate = new Date(0); // All time
+        case 'last_week':    startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000); break;
+        case 'last_month':   startDate = new Date(now.getFullYear(), now.getMonth() - 1, now.getDate()); break;
+        case 'last_quarter': startDate = new Date(now.getFullYear(), now.getMonth() - 3, now.getDate()); break;
+        case 'last_year':    startDate = new Date(now.getFullYear() - 1, now.getMonth(), now.getDate()); break;
+        default:             startDate = new Date(0);
       }
 
-      // Filter risks by date
-      filteredRisks = filteredRisks.filter(risk => {
-        const riskDate = risk.createdAt;
-        return riskDate >= startDate;
-      });
+      filteredRisks     = filteredRisks.filter(r => (r.createdAt ? r.createdAt >= startDate : true));
+      filteredTreatments= filteredTreatments.filter(t => (t.createdAt ? t.createdAt >= startDate : true));
+      filteredIncidents = filteredIncidents.filter(i => (i.incidentDate ? i.incidentDate >= startDate : true));
 
-      // Filter treatments by date
-      filteredTreatments = filteredTreatments.filter(plan => {
-        const planDate = plan.createdAt;
-        return planDate >= startDate;
-      });
-
-      // Filter incidents by date
-      filteredIncidents = filteredIncidents.filter(incident => {
-        const incidentDate = incident.incidentDate;
-        return incidentDate >= startDate;
-      });
-
-      // Filter by risk level
       if (reportConfig.riskLevel !== 'all') {
-        filteredRisks = filteredRisks.filter(risk => {
-          const score = (risk.likelihood || 1) * (risk.impact || 1);
-          
-          if (reportConfig.riskLevel === 'high' && score >= 16) return true;
-          if (reportConfig.riskLevel === 'medium' && score >= 10 && score < 16) return true;
-          if (reportConfig.riskLevel === 'low' && score < 10) return true;
+        filteredRisks = filteredRisks.filter(r => {
+          const s = scoreByConfig(r.likelihood ?? r.initialProbability, r.impact ?? r.initialImpact);
+          if (reportConfig.riskLevel === 'high'   && s >= 16) return true;
+          if (reportConfig.riskLevel === 'medium' && s >= 10 && s < 16) return true;
+          if (reportConfig.riskLevel === 'low'    && s < 10) return true;
           return false;
         });
       }
 
       return { filteredRisks, filteredTreatments, filteredIncidents };
     } catch (error) {
-      console.error('❌ Error in getFilteredData:', error);
+      console.error('Error in getFilteredData:', error);
       return { filteredRisks: [], filteredTreatments: [], filteredIncidents: [] };
     }
   };
 
-  // ✅ PDF EXPORT BARU - Risk Register Landscape
-  const generatePDF = async () => {
-    setGenerating(true);
-    try {
-      const { filteredRisks } = getFilteredData();
-      
-      if (filteredRisks.length === 0) {
-        showSnackbar('Tidak ada data risiko untuk diexport!', 'warning');
-        setGenerating(false);
-        return;
-      }
+  // ======== EXPORT: RISK REGISTER – PDF (landscape, grouped header) ========
 
-      console.log('🔄 Generating PDF Risk Register (Landscape)...');
+// ======== EXPORT: RISK REGISTER – PDF (final: huruf kecil, +skala L/I & existing) ========
+const exportRiskRegisterPDF = async (filteredRisks) => {
+  const { jsPDF } = await import('jspdf');
+  const autoTable = (await import('jspdf-autotable')).default;
 
-      // Dynamic import jsPDF
-      const { jsPDF } = await import('jspdf');
-      const doc = new jsPDF('landscape'); // ✅ LANDSCAPE MODE
+  // A4 landscape
+  const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
+  const page = { w: doc.internal.pageSize.getWidth(), h: doc.internal.pageSize.getHeight() };
 
-      // Set document properties
-      const pageWidth = 297; // A4 landscape width in mm
-      const pageHeight = 210; // A4 landscape height in mm
-      const margin = 10;
-      let yPosition = margin;
+  const M = 24;             // margin kiri/kanan sedikit diperkecil agar muat
+  const headerH = 60;       // tinggi header
+  const nowStr = new Date().toLocaleString('id-ID');
 
-      // Function untuk check new page
-      const checkNewPage = (spaceNeeded = 10) => {
-        if (yPosition + spaceNeeded > pageHeight - margin) {
-          doc.addPage('landscape');
-          yPosition = margin;
-          return true;
-        }
-        return false;
-      };
+  // ===== Header =====
+  doc.setFillColor(96, 125, 139);
+  doc.rect(0, 0, page.w, headerH, 'F');
 
-      // ✅ HEADER - RISK REGISTER LENGKAP
-      doc.setFillColor(25, 118, 210);
-      doc.rect(0, 0, pageWidth, 15, 'F');
-      doc.setTextColor(255, 255, 255);
-      doc.setFontSize(16);
-      doc.setFont('helvetica', 'bold');
-      doc.text('RISK REGISTER - LAPORAN LENGKAP', pageWidth / 2, 9, { align: 'center' });
-      
-      doc.setFontSize(10);
-      doc.text('Sistem Enterprise Risk Management', pageWidth / 2, 14, { align: 'center' });
-      
-      yPosition = 20;
+  if (LOGO_BASE64) {
+    try { doc.addImage(LOGO_BASE64, 'PNG', M, 10, 40, 40); } catch {}
+  }
 
-      // ✅ REPORT INFO
-      doc.setTextColor(0, 0, 0);
-      doc.setFontSize(8);
-      doc.setFont('helvetica', 'normal');
-      
-      const reportInfo = [
-        `Tanggal Generate: ${new Date().toLocaleString('id-ID')}`,
-        `Jumlah Data: ${filteredRisks.length} risiko`,
-        `High/Extreme: ${filteredRisks.filter(r => (r.likelihood * r.impact) >= 16).length}`,
-        `Generated By: ${userData?.name || 'Unknown'}`
-      ];
+  doc.setTextColor(255);
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(13); // ===== Judul 13 pt =====
+  doc.text('RISK REGISTER', page.w / 2, 30, { align: 'center' });
 
-      reportInfo.forEach((info, i) => {
-        doc.text(info, margin + (i * 70), yPosition);
-      });
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(8);  // subjudul perusahaan, kecil
+  doc.text('PT Odira Energy Karang Agung', page.w / 2, 46, { align: 'center' });
 
-      yPosition += 8;
+  // Meta info (6pt sesuai permintaan "kecilkan hurufnya")
+  doc.setTextColor(0);
+  doc.setFontSize(6);
+  doc.text(`Generated: ${nowStr}`, M, headerH + 10);
+  doc.text(`Period: ${reportConfig.dateRange}`, M + 160, headerH + 10);
+  doc.text(`By: ${userData?.name || userData?.displayName || 'Administrator'}`, M + 320, headerH + 10);
 
-      // ✅ TABLE HEADER DETAIL LENGKAP (20 kolom)
-      checkNewPage(15);
-      doc.setFillColor(240, 240, 240);
-      doc.rect(margin, yPosition, pageWidth - (margin * 2), 8, 'F');
-      doc.setTextColor(0, 0, 0);
-      doc.setFontSize(6);
-      doc.setFont('helvetica', 'bold');
-      
-      // Define column positions (20 kolom dalam landscape)
-      const colPositions = {
-        no: margin + 2,
-        id: margin + 8,
-        title: margin + 18,
-        dept: margin + 48,
-        category: margin + 58,
-        type: margin + 68,
-        source: margin + 78,
-        likelihood: margin + 88,
-        impact: margin + 94,
-        score: margin + 100,
-        level: margin + 108,
-        classification: margin + 116,
-        owner: margin + 134,
-        existingControl: margin + 152,
-        status: margin + 172,
-        identificationDate: margin + 182,
-        targetDate: margin + 200,
-        progress: margin + 218,
-        createdBy: margin + 226,
-        createdAt: margin + 244
-      };
+  // ===== Head (2 tingkat) — lengkap + jelas =====
+  const head = [
+    [
+      { content: 'No', rowSpan: 2 },
+      { content: 'Kode Risiko', rowSpan: 2 },
+      { content: 'Sumber Risiko', rowSpan: 2 },
+      { content: 'Jenis Risiko', rowSpan: 2 },
+      { content: 'Departemen', rowSpan: 2 },
+      { content: 'Nama Risiko', rowSpan: 2 },
 
-      // Header titles
-      doc.text('No', colPositions.no, yPosition + 5);
-      doc.text('ID', colPositions.id, yPosition + 5);
-      doc.text('Judul Risiko', colPositions.title, yPosition + 5);
-      doc.text('Dept', colPositions.dept, yPosition + 5);
-      doc.text('Kategori', colPositions.category, yPosition + 5);
-      doc.text('Tipe', colPositions.type, yPosition + 5);
-      doc.text('Sumber', colPositions.source, yPosition + 5);
-      doc.text('L', colPositions.likelihood, yPosition + 5);
-      doc.text('I', colPositions.impact, yPosition + 5);
-      doc.text('Score', colPositions.score, yPosition + 5);
-      doc.text('Level', colPositions.level, yPosition + 5);
-      doc.text('Klasifikasi', colPositions.classification, yPosition + 5);
-      doc.text('Pemilik', colPositions.owner, yPosition + 5);
-      doc.text('Existing Control', colPositions.existingControl, yPosition + 5);
-      doc.text('Status', colPositions.status, yPosition + 5);
-      doc.text('Tgl. Identifikasi', colPositions.identificationDate, yPosition + 5);
-      doc.text('Target', colPositions.targetDate, yPosition + 5);
-      doc.text('Progress', colPositions.progress, yPosition + 5);
-      doc.text('Dibuat Oleh', colPositions.createdBy, yPosition + 5);
-      doc.text('Tanggal Dibuat', colPositions.createdAt, yPosition + 5);
+      { content: 'Deskripsi', rowSpan: 2 },
+      { content: 'Penyebab', rowSpan: 2 },
+      { content: 'Dampak', rowSpan: 2 },
 
-      yPosition += 10;
+      { content: 'Inheren', colSpan: 5 },   // + Likelihood, Impact, Skor, Existing, Rp
+      { content: 'Residual', colSpan: 4 },  // + Likelihood, Impact, Skor, Rp
 
-      // ✅ TABLE DATA - Semua field dari form
-      doc.setFont('helvetica', 'normal');
-      
-      filteredRisks.forEach((risk, index) => {
-        checkNewPage(8);
-        
-        // Alternate row background
-        if (index % 2 === 0) {
-          doc.setFillColor(250, 250, 250);
-          doc.rect(margin, yPosition - 2, pageWidth - (margin * 2), 8, 'F');
-        }
+      { content: 'Pengendalian Tambahan', rowSpan: 2 },
+      { content: 'Biaya Pengendalian', rowSpan: 2 },
+      { content: 'Pemilik Risiko', rowSpan: 2 },
+      { content: 'PIC', rowSpan: 2 },
+    ],
+    [
+      'Skala Kemungkinan', 'Skala Dampak', 'Nilai risiko', 'Pengendalian Existing', 'Nilai Dampak (Rp)',
+      'Skala Kemungkinan', 'Skala Dampak', 'Nilai risiko', 'Nilai Dampak (Rp)',
+    ],
+  ];
 
-        doc.setFontSize(5);
-        doc.setTextColor(0, 0, 0);
-        
-        // Calculate risk score and level
-        const likelihood = risk.likelihood || 1;
-        const impact = risk.impact || 1;
-        const score = likelihood * impact;
-        const level = score >= 20 ? 'E' : score >= 16 ? 'H' : score >= 10 ? 'M' : 'L';
-        
-        // Format dates
-        const formatDate = (date) => {
-          if (!date) return '-';
-          try {
-            if (date.toDate) date = date.toDate();
-            return new Date(date).toLocaleDateString('id-ID');
-          } catch {
-            return '-';
-          }
-        };
+  // ===== Body =====
+  const body = filteredRisks.map((r, i) => {
+    const inherentScore = scoreByConfig(r.initialProbability, r.initialImpact);
+    const residualScore = scoreByConfig(r.residualProbability, r.residualImpact);
 
-        // Truncate text for fit columns
-        const truncate = (text, maxLength) => {
-          if (!text) return '-';
-          return text.length > maxLength ? text.substring(0, maxLength) + '...' : text;
-        };
+    return [
+      i + 1,
+      r.riskCode || r.id?.slice(0, 6) || '-',
+      r.riskSource || '-',
+      r.riskType || '-',
+      r.department || '-',
+      r.title || r.riskDescription || '-',
 
-        // Fill data row
-        doc.text((index + 1).toString(), colPositions.no, yPosition + 5);
-        doc.text(truncate(risk.riskCode || risk.id.substring(0, 6), 6), colPositions.id, yPosition + 5);
-        doc.text(truncate(risk.title || 'No Title', 20), colPositions.title, yPosition + 5);
-        doc.text(truncate(risk.department, 6), colPositions.dept, yPosition + 5);
-        doc.text(truncate(risk.riskCategory, 6), colPositions.category, yPosition + 5);
-        doc.text(truncate(risk.riskType, 6), colPositions.type, yPosition + 5);
-        doc.text(truncate(risk.riskSource, 6), colPositions.source, yPosition + 5);
-        doc.text(likelihood.toString(), colPositions.likelihood, yPosition + 5);
-        doc.text(impact.toString(), colPositions.impact, yPosition + 5);
-        doc.text(score.toString(), colPositions.score, yPosition + 5);
-        doc.text(level, colPositions.level, yPosition + 5);
-        doc.text(truncate(risk.classification, 10), colPositions.classification, yPosition + 5);
-        doc.text(truncate(risk.riskOwner, 10), colPositions.owner, yPosition + 5);
-        doc.text(truncate(risk.existingControl, 12), colPositions.existingControl, yPosition + 5);
-        doc.text(truncate(risk.status, 6), colPositions.status, yPosition + 5);
-        doc.text(formatDate(risk.identificationDate), colPositions.identificationDate, yPosition + 5);
-        doc.text(formatDate(risk.targetDate), colPositions.targetDate, yPosition + 5);
-        doc.text(`${risk.progress || 0}%`, colPositions.progress, yPosition + 5);
-        doc.text(truncate(risk.createdBy, 8), colPositions.createdBy, yPosition + 5);
-        doc.text(formatDate(risk.createdAt), colPositions.createdAt, yPosition + 5);
-        
-        yPosition += 8;
-      });
+      r.riskDescription || '-',
+      r.cause || '-',
+      r.effect || '-',
 
-      yPosition += 5;
+      // INHEREN (urutan: L, I, Skor, Existing, Rp)
+      r.initialProbability ?? '',
+      r.initialImpact ?? '',
+      inherentScore,
+      r.existingControl || '-',
+      fmtRp(r.inherentRiskQuantification),
 
-      // ✅ RISK DESCRIPTION DETAILS (Optional untuk 5 risiko pertama)
-      if (reportConfig.reportType === 'risk_register') {
-        checkNewPage(30);
-        doc.setFontSize(10);
-        doc.setTextColor(25, 118, 210);
-        doc.text('DETAIL DESKRIPSI RISIKO (Sample 5 Data)', margin, yPosition);
-        yPosition += 8;
+      // RESIDUAL (urutan: L, I, Skor, Rp)
+      r.residualProbability ?? '',
+      r.residualImpact ?? '',
+      residualScore,
+      fmtRp(r.residualRiskQuantification),
 
-        doc.setFontSize(7);
-        doc.setTextColor(0, 0, 0);
-        
-        filteredRisks.slice(0, 5).forEach((risk, index) => {
-          checkNewPage(25);
-          
-          doc.setFont('helvetica', 'bold');
-          doc.text(`${index + 1}. ${risk.title || 'No Title'}`, margin, yPosition);
-          yPosition += 5;
-          
-          doc.setFont('helvetica', 'normal');
-          const details = [
-            `Deskripsi: ${risk.riskDescription || '-'}`,
-            `Penyebab: ${risk.cause || '-'}`,
-            `Dampak: ${risk.effect || '-'}`,
-            `Komentar: ${risk.comments || '-'}`
-          ];
-          
-          details.forEach(detail => {
-            checkNewPage(4);
-            doc.text(detail, margin + 5, yPosition);
-            yPosition += 4;
-          });
-          
-          yPosition += 5;
-        });
-      }
+      // Tambahan
+      r.additionalControls || '-',
+      fmtRp(r.controlCost),
+      r.riskOwner || '-',
+      r.responsiblePerson || '-',
+    ];
+  });
 
-      // ✅ FOOTER
-      const pageCount = doc.internal.getNumberOfPages();
-      for (let i = 1; i <= pageCount; i++) {
-        doc.setPage(i);
-        doc.setFontSize(6);
-        doc.setTextColor(100, 100, 100);
-        doc.text(
-          `Halaman ${i} dari ${pageCount} | Generated: ${new Date().toLocaleString('id-ID')}`, 
-          pageWidth / 2, 
-          pageHeight - 5, 
-          { align: 'center' }
-        );
-      }
+  // ===== Lebar kolom & skala agar muat halaman =====
+  const totalWidth = page.w - 2 * M;
 
-      // ✅ SAVE PDF
-      const fileName = `Risk_Register_${new Date().toISOString().split('T')[0]}.pdf`;
-      doc.save(fileName);
-      
-      console.log('✅ PDF Risk Register berhasil dibuat (Landscape)');
-      showSnackbar('PDF Risk Register berhasil dibuat dalam format landscape!', 'success');
-      
-    } catch (error) {
-      console.error('❌ Error generating PDF:', error);
-      showSnackbar('Error membuat PDF: ' + error.message, 'error');
-    } finally {
-      setGenerating(false);
-    }
+  // Kolom lebar — dibuat sedikit lebih ramping karena font 6pt
+  const colW = {
+    0: 22,   // No
+    1: 60,   // Kode Risiko
+    2: 80,   // Sumber Risiko
+    3: 80,   // Jenis Risiko
+    4: 84,   // Departemen
+    5: 120,  // Nama Risiko
+
+    6: 210,  // Deskripsi
+    7: 150,  // Penyebab
+    8: 150,  // Dampak
+
+    // INHEREN
+    9:  80,  // Skala Kemungkinan (Inheren)
+    10: 80,  // Skala Dampak (Inheren)
+    11: 68,  // Skor Inheren
+    12: 180, // Pengendalian Existing (Inheren) — dibuat lebar sesuai permintaan
+    13: 96,  // Nilai Dampak (Rp) Inheren
+
+    // RESIDUAL
+    14: 80,  // Skala Kemungkinan (Residual)
+    15: 80,  // Skala Dampak (Residual)
+    16: 68,  // Skor Residual
+    17: 96,  // Nilai Dampak (Rp) Residual
+
+    // Tambahan
+    18: 170, // Pengendalian Tambahan
+    19: 96,  // Biaya Pengendalian
+    20: 96,  // Pemilik Risiko
+    21: 86,  // PIC
   };
 
-  // Generate Excel Report - DIPERBAIKI untuk Risk Register lengkap
-  const generateExcel = async () => {
+  const sumW = Object.values(colW).reduce((a, b) => a + b, 0);
+  const scale = sumW > totalWidth ? (totalWidth / sumW) : 1;
+
+  const columnStyles = Object.fromEntries(
+    Object.keys(colW).map((idx) => ([
+      Number(idx),
+      {
+        cellWidth: Math.floor(colW[idx] * scale),
+        halign: [0, 11, 16].includes(Number(idx)) ? 'center' : 'left', // center No & skor
+      },
+    ])),
+  );
+
+  // ===== Tabel =====
+  autoTable(doc, {
+    startY: headerH + 24,
+    head,
+    body,
+    theme: 'grid',
+    styles: {
+      font: 'helvetica',
+      fontSize: 6, // ===== Isi tabel 6 pt =====
+      cellPadding: { top: 2, right: 2, bottom: 2, left: 2 },
+      lineColor: 225,
+      textColor: 33,
+      valign: 'top',
+      overflow: 'linebreak', // wrap teks panjang
+    },
+    headStyles: {
+      fontSize: 6, // ===== Header tabel 6 pt =====
+      fontStyle: 'bold',
+      fillColor: [245, 247, 250],
+      textColor: 33,
+      halign: 'center',
+    },
+    columnStyles,
+    margin: { left: M, right: M },
+    tableWidth: 'wrap',   // mengikuti cellWidth
+    pageBreak: 'auto',
+
+    // Zebra rows + pewarnaan sel skor
+    willDrawCell: (data) => {
+      const { section, row, column, cell } = data;
+
+      // Zebra untuk body
+      if (section === 'body' && row.index % 2 === 1) {
+        doc.setFillColor(250, 250, 252);
+        doc.rect(cell.x, cell.y, cell.width, cell.height, 'F');
+      }
+
+      // Pewarnaan skor (Inheren: col 11, Residual: col 16)
+      if (section === 'body' && (column.index === 11 || column.index === 16)) {
+        const score = Number(cell.raw);
+        const lvl = levelByConfig(score).level;
+        const map = {
+          Extreme: [255, 77, 77],
+          High:    [255, 153, 51],
+          Medium:  [255, 210, 77],
+          Low:     [120, 200, 120],
+        };
+        const bg = map[lvl] || [230, 230, 230];
+        doc.setFillColor(...bg);
+        doc.rect(cell.x, cell.y, cell.width, cell.height, 'F');
+        doc.setTextColor(33);
+      }
+    },
+
+    didDrawPage: () => {
+      // Footer 6 pt
+      const str = `Halaman ${doc.getCurrentPageInfo().pageNumber} dari ${doc.internal.getNumberOfPages()} • Generated ${nowStr}`;
+      doc.setFontSize(6);
+      doc.setTextColor(120);
+      doc.text(str, page.w / 2, page.h - 12, { align: 'center' });
+    },
+  });
+
+  doc.save(`Risk_Register_${new Date().toISOString().slice(0, 10)}.pdf`);
+};
+
+
+
+  // ======== EXPORT: RISK REGISTER – XLSX (skor via konfigurasi) ========
+  const exportRiskRegisterXLSX = async (filteredRisks) => {
+    const ExcelJS = (await import('exceljs')).default;
+
+    const wb = new ExcelJS.Workbook();
+    wb.creator = userData?.name || 'ERM System'; wb.created = new Date();
+
+    const ws = wb.addWorksheet('Risk Register', { views: [{ state: 'frozen', xSplit: 0, ySplit: 4 }] });
+
+    // (Opsional) logo di A1:C3
+    if (LOGO_BASE64) {
+      try {
+        const imgId = wb.addImage({ base64: LOGO_BASE64, extension: 'png' });
+        ws.addImage(imgId, { tl: { col: 0, row: 0 }, br: { col: 3, row: 3 } });
+      } catch {}
+    }
+
+    // Title
+    ws.mergeCells('D1', 'U1');
+    const tCell = ws.getCell('D1');
+    tCell.value = 'RISK REGISTER';
+    tCell.font = { name: 'Calibri', size: 16, bold: true };
+    tCell.alignment = { horizontal: 'center', vertical: 'middle' };
+    ws.getRow(1).height = 26;
+
+    ws.mergeCells('D2', 'U2');
+    ws.getCell('D2').value = `PT Odira Energy Karang Agung • Generated: ${new Date().toLocaleString('id-ID')}`;
+    ws.getCell('D2').alignment = { horizontal: 'center' };
+    ws.getRow(2).height = 18;
+
+    // Grup header baris 3 (Inheren & Residual)
+    ws.mergeCells('J3', 'M3'); ws.getCell('J3').value = 'Inheren';
+    ws.getCell('J3').font = { name: 'Calibri', size: 11, bold: true };
+    ws.getCell('J3').alignment = { horizontal: 'center', vertical: 'middle' };
+
+    ws.mergeCells('N3', 'Q3'); ws.getCell('N3').value = 'Residual';
+    ws.getCell('N3').font = { name: 'Calibri', size: 11, bold: true };
+    ws.getCell('N3').alignment = { horizontal: 'center', vertical: 'middle' };
+    ws.getRow(3).height = 22;
+
+    // Header rinci (baris 4) sesuai urutan Ibu
+    const columns = [
+      { key: 'no', header: 'No', width: 6 },
+      { key: 'riskCode', header: 'Kode Risiko', width: 12 },
+      { key: 'riskSource', header: 'Sumber Risiko', width: 14 },
+      { key: 'riskType', header: 'Jenis Risiko', width: 14 },
+      { key: 'department', header: 'Departemen', width: 14 },
+      { key: 'title', header: 'Nama Risiko', width: 24 },
+
+      { key: 'riskDescription', header: 'Deskripsi', width: 56, wrap: true },
+      { key: 'cause', header: 'Penyebab', width: 40, wrap: true },
+      { key: 'effect', header: 'Dampak', width: 40, wrap: true },
+
+      // INHEREN
+      { key: 'inherentRiskQuantification', header: 'Nilai Dampak (Rp)', width: 20 },
+      { key: 'initialProbability', header: 'Nilai & Skala Kemungkinan', width: 20 },
+      { key: 'initialImpact', header: 'Skala Dampak', width: 16 },
+      { key: 'inherentScore', header: 'Nilai risiko', width: 14 },
+
+      { key: 'existingControl', header: 'Pengendalian Existing', width: 40, wrap: true },
+
+      // RESIDUAL
+      { key: 'residualRiskQuantification', header: 'Nilai Dampak Residual (Rp)', width: 22 },
+      { key: 'residualProbability', header: 'Skala Kemungkinan', width: 18 },
+      { key: 'residualImpact', header: 'Skala Dampak', width: 16 },
+      { key: 'residualScore', header: 'Nilai risiko', width: 14 },
+
+      // Tambahan
+      { key: 'additionalControls', header: 'Pengendalian Tambahan', width: 40, wrap: true },
+      { key: 'controlCost', header: 'Biaya Pengendalian', width: 18 },
+      { key: 'riskOwner', header: 'Pemilik Risiko', width: 18 },
+      { key: 'responsiblePerson', header: 'PIC', width: 16 },
+    ];
+
+    ws.columns = columns.map(c => ({
+      key: c.key, width: c.width,
+      style: { font: { name: 'Calibri', size: 9 }, alignment: { vertical: 'top', wrapText: !!c.wrap } }
+    }));
+
+    const headerRow = ws.getRow(4);
+    headerRow.values = columns.map(c => c.header);
+    headerRow.font = { name: 'Calibri', size: 10, bold: true };
+    headerRow.alignment = { horizontal: 'center', vertical: 'middle' };
+    headerRow.height = 22;
+
+    // Rows
+    let iRow = 5;
+    filteredRisks.forEach((r, i) => {
+      const inherentScore = scoreByConfig(r.initialProbability, r.initialImpact);
+      const residualScore = scoreByConfig(r.residualProbability, r.residualImpact);
+
+      ws.addRow({
+        no: i + 1,
+        riskCode: r.riskCode || r.id?.slice(0,6) || '-',
+        riskSource: r.riskSource || '-',
+        riskType: r.riskType || '-',
+        department: r.department || '-',
+        title: r.title || r.riskDescription || '-',
+
+        riskDescription: r.riskDescription || '-',
+        cause: r.cause || '-',
+        effect: r.effect || '-',
+
+        // INHEREN
+        inherentRiskQuantification: fmtRp(r.inherentRiskQuantification),
+        initialProbability: r.initialProbability || '',
+        initialImpact: r.initialImpact || '',
+        inherentScore,
+
+        existingControl: r.existingControl || '-',
+
+        // RESIDUAL
+        residualRiskQuantification: fmtRp(r.residualRiskQuantification),
+        residualProbability: r.residualProbability || '',
+        residualImpact: r.residualImpact || '',
+        residualScore,
+
+        // Tambahan
+        additionalControls: r.additionalControls || '-',
+        controlCost: fmtRp(r.controlCost),
+        riskOwner: r.riskOwner || '-',
+        responsiblePerson: r.responsiblePerson || '-',
+      });
+
+      // Tinggi baris dinamis untuk teks panjang
+      const lens = [
+        String(r.riskDescription || r.title || '').length,
+        String(r.cause || '').length,
+        String(r.effect || '').length,
+        String(r.existingControl || '').length,
+        String(r.additionalControls || '').length,
+      ];
+      const longest = Math.max(...lens);
+      const estLines = Math.ceil(longest / 60); // ±60 char/baris
+      ws.getRow(iRow).height = Math.max(22, 18 * estLines);
+      iRow++;
+    });
+
+    const buf = await wb.xlsx.writeBuffer();
+    const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    saveAs(blob, `Risk_Register_${new Date().toISOString().slice(0,10)}.xlsx`);
+  };
+
+  // ======== EXPORT: EXECUTIVE SUMMARY – PDF ========
+  const exportExecutiveSummaryPDF = async ({ filteredRisks, filteredTreatments, filteredIncidents }) => {
+    const { jsPDF } = await import('jspdf');
+    const autoTable = (await import('jspdf-autotable')).default;
+
+    const doc = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'a4' });
+    const page = { w: doc.internal.pageSize.getWidth(), h: doc.internal.pageSize.getHeight() };
+    const M = 32, headerH = 90;
+    const nowStr = new Date().toLocaleString('id-ID');
+
+    // Header
+    doc.setFillColor(25,118,210);
+    doc.rect(0, 0, page.w, headerH, 'F');
+    if (LOGO_BASE64) { try { doc.addImage(LOGO_BASE64, 'PNG', M, 20, 50, 50); } catch {} }
+    doc.setTextColor(255); doc.setFont('helvetica', 'bold'); doc.setFontSize(22);
+    doc.text('EXECUTIVE SUMMARY', page.w / 2, 46, { align: 'center' });
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(11);
+    doc.text('PT Odira Energy Karang Agung', page.w / 2, 66, { align: 'center' });
+
+    // Metrics (skor via konfigurasi dengan L/I terkini bila ada)
+    const total     = filteredRisks.length;
+    const highExtreme = filteredRisks.filter(r => scoreByConfig(r.likelihood ?? r.initialProbability, r.impact ?? r.initialImpact) >= 16).length;
+    const plans     = filteredTreatments.length;
+    const completed = filteredTreatments.filter(p => p.status === 'completed').length;
+    const inci      = filteredIncidents.length;
+    const critical  = filteredIncidents.filter(i => (i.severity || '').toLowerCase() === 'critical').length;
+
+    // Cards
+    const cards = [
+      { label: 'Total Risks', value: total },
+      { label: 'High & Extreme', value: highExtreme },
+      { label: 'Treatment Plans', value: plans },
+      { label: 'Completed Treatments', value: completed },
+      { label: 'Incidents', value: inci },
+      { label: 'Critical Incidents', value: critical },
+    ];
+    const cardW = 162, cardH = 70, gap = 12; let cx = M; const cy = headerH + 20;
+    cards.slice(0,4).forEach(c => {
+      doc.setFillColor(245,247,250);
+      doc.roundedRect(cx, cy, cardW, cardH, 8, 8, 'F');
+      doc.setDrawColor(230); doc.roundedRect(cx, cy, cardW, cardH, 8, 8, 'S');
+      doc.setTextColor(99); doc.setFontSize(10); doc.text(c.label, cx + 12, cy + 24);
+      doc.setTextColor(33); doc.setFont('helvetica', 'bold'); doc.setFontSize(22);
+      doc.text(String(c.value), cx + 12, cy + 48);
+      cx += cardW + gap;
+    });
+
+    // Distribusi
+    const dist = { Extreme: 0, High: 0, Medium: 0, Low: 0 };
+    filteredRisks.forEach(r => {
+      const s = scoreByConfig(r.likelihood ?? r.initialProbability, r.impact ?? r.initialImpact);
+      dist[levelByConfig(s).level]++; 
+    });
+    doc.setFont('helvetica', 'bold'); doc.setTextColor(33); doc.setFontSize(12);
+    doc.text('Risk Distribution by Level', M, cy + cardH + 24);
+
+    autoTable(doc, {
+      startY: cy + cardH + 30,
+      head: [['Level', 'Jumlah', 'Persentase']],
+      body: Object.entries(dist).map(([lvl,cnt]) => [lvl, cnt, `${Math.round((cnt/(total||1))*100)}%`]),
+      theme: 'grid',
+      styles: { font: 'helvetica', fontSize: 9, cellPadding: 4, lineColor: 230, textColor: 33 },
+      headStyles: { fillColor: [245,247,250], textColor: 33, fontStyle: 'bold' },
+      margin: { left: M, right: M },
+    });
+
+    // Top 10 (skor via konfigurasi)
+    doc.text('Top 10 Risks by Score', M, (doc.lastAutoTable?.finalY || (cy + cardH + 30)) + 20);
+    const top = [...filteredRisks].sort((a,b)=>{
+      const sb = scoreByConfig(b.likelihood ?? b.initialProbability, b.impact ?? b.initialImpact);
+      const sa = scoreByConfig(a.likelihood ?? a.initialProbability, a.impact ?? a.initialImpact);
+      return sb - sa;
+    }).slice(0,10).map(r=>{
+      const s = scoreByConfig(r.likelihood ?? r.initialProbability, r.impact ?? r.initialImpact);
+      const lvl = levelByConfig(s).level;
+      return [r.riskCode || r.id?.slice(0,6) || '-', (r.riskDescription || r.title || '').slice(0,80), r.department || '-', s, lvl, r.status || 'Identified'];
+    });
+
+    autoTable(doc, {
+      startY: (doc.lastAutoTable?.finalY || (cy + cardH + 30)) + 26,
+      head: [['Kode','Deskripsi','Dept','Score','Level','Status']],
+      body: top, theme: 'grid',
+      styles: { font: 'helvetica', fontSize: 8, cellPadding: 3, lineColor: 230, textColor: 33 },
+      headStyles: { fillColor: [245,247,250], textColor: 33, fontStyle: 'bold' },
+      margin: { left: M, right: M },
+    });
+
+    doc.setFontSize(9); doc.setTextColor(120);
+    doc.text(`Generated: ${nowStr}`, page.w / 2, page.h - 20, { align: 'center' });
+    doc.save(`Executive_Summary_${new Date().toISOString().slice(0,10)}.pdf`);
+  };
+
+  // ======== EXPORT: EXECUTIVE SUMMARY – XLSX ========
+  const exportExecutiveSummaryXLSX = async ({ filteredRisks, filteredTreatments, filteredIncidents }) => {
+    const ExcelJS = (await import('exceljs')).default;
+
+    const wb = new ExcelJS.Workbook();
+    wb.creator = userData?.name || 'ERM System'; wb.created = new Date();
+
+    const ws = wb.addWorksheet('Executive Summary');
+
+    const total     = filteredRisks.length;
+    const highExtreme = filteredRisks.filter(r => scoreByConfig(r.likelihood ?? r.initialProbability, r.impact ?? r.initialImpact) >= 16).length;
+    const plans     = filteredTreatments.length;
+    const completed = filteredTreatments.filter(p => p.status === 'completed').length;
+    const inci      = filteredIncidents.length;
+    const critical  = filteredIncidents.filter(i => (i.severity || '').toLowerCase() === 'critical').length;
+
+    ws.addRow(['Executive Summary']); ws.getRow(1).font = { bold: true, size: 16 };
+    ws.addRow([]);
+    ws.addRow(['Metric', 'Value']);
+    ws.addRow(['Total Risks', total]);
+    ws.addRow(['High & Extreme', highExtreme]);
+    ws.addRow(['Treatment Plans', plans]);
+    ws.addRow(['Completed Treatments', completed]);
+    ws.addRow(['Incidents', inci]);
+    ws.addRow(['Critical Incidents', critical]);
+    ws.addRow([]);
+
+    // Distribution
+    ws.addRow(['Risk Distribution by Level']); ws.getRow(ws.lastRow.number).font = { bold: true, size: 12 };
+    const dist = { Extreme: 0, High: 0, Medium: 0, Low: 0 };
+    filteredRisks.forEach(r => {
+      const s = scoreByConfig(r.likelihood ?? r.initialProbability, r.impact ?? r.initialImpact);
+      dist[levelByConfig(s).level]++; 
+    });
+    ws.addRow(['Level','Jumlah','Persentase']);
+    Object.entries(dist).forEach(([lvl,cnt])=> ws.addRow([lvl, cnt, `${Math.round((cnt/(total||1))*100)}%`]));
+
+    // Top 10
+    ws.addRow([]); ws.addRow(['Top 10 Risks by Score']); ws.getRow(ws.lastRow.number).font = { bold: true, size: 12 };
+    ws.addRow(['Kode','Deskripsi','Dept','Score','Level','Status']);
+    [...filteredRisks].sort((a,b)=>{
+      const sb = scoreByConfig(b.likelihood ?? b.initialProbability, b.impact ?? b.initialImpact);
+      const sa = scoreByConfig(a.likelihood ?? a.initialProbability, a.impact ?? a.initialImpact);
+      return sb - sa;
+    }).slice(0,10).forEach(r=>{
+      const s = scoreByConfig(r.likelihood ?? r.initialProbability, r.impact ?? r.initialImpact);
+      const lvl = levelByConfig(s).level;
+      ws.addRow([r.riskCode || r.id?.slice(0,6) || '-', r.riskDescription || r.title || '-', r.department || '-', s, lvl, r.status || 'Identified']);
+    });
+
+    const buf = await wb.xlsx.writeBuffer();
+    saveAs(new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
+           `Executive_Summary_${new Date().toISOString().slice(0,10)}.xlsx`);
+  };
+
+  // ======== EXPORT: EXECUTIVE SUMMARY – TEXT (.txt) ========
+  const exportExecutiveSummaryTXT = ({ filteredRisks, filteredTreatments, filteredIncidents }) => {
+    const total     = filteredRisks.length;
+    const highExtreme = filteredRisks.filter(r => scoreByConfig(r.likelihood ?? r.initialProbability, r.impact ?? r.initialImpact) >= 16).length;
+    const plans     = filteredTreatments.length;
+    const completed = filteredTreatments.filter(p => p.status === 'completed').length;
+    const inci      = filteredIncidents.length;
+    const critical  = filteredIncidents.filter(i => (i.severity || '').toLowerCase() === 'critical').length;
+
+    const dist = { Extreme: 0, High: 0, Medium: 0, Low: 0 };
+    filteredRisks.forEach(r => { 
+      const s = scoreByConfig(r.likelihood ?? r.initialProbability, r.impact ?? r.initialImpact);
+      dist[levelByConfig(s).level]++; 
+    });
+
+    const top = [...filteredRisks].sort((a,b)=>{
+      const sb = scoreByConfig(b.likelihood ?? b.initialProbability, b.impact ?? b.initialImpact);
+      const sa = scoreByConfig(a.likelihood ?? a.initialProbability, a.impact ?? a.initialImpact);
+      return sb - sa;
+    }).slice(0,10);
+
+    const lines = [];
+    lines.push('EXECUTIVE SUMMARY');
+    lines.push(`Generated: ${new Date().toLocaleString('id-ID')}`);
+    lines.push('');
+    lines.push('== Key Metrics ==');
+    lines.push(`Total Risks: ${total}`);
+    lines.push(`High & Extreme: ${highExtreme}`);
+    lines.push(`Treatment Plans: ${plans}`);
+    lines.push(`Completed Treatments: ${completed}`);
+    lines.push(`Incidents: ${inci}`);
+    lines.push(`Critical Incidents: ${critical}`);
+    lines.push('');
+    lines.push('== Risk Distribution ==');
+    Object.entries(dist).forEach(([lvl, cnt]) => {
+      const pct = Math.round((cnt / (total || 1)) * 100);
+      lines.push(`${lvl}: ${cnt} (${pct}%)`);
+    });
+    lines.push('');
+    lines.push('== Top 10 Risks by Score ==');
+    top.forEach((r, idx) => {
+      const s = scoreByConfig(r.likelihood ?? r.initialProbability, r.impact ?? r.initialImpact);
+      const lvl = levelByConfig(s).level;
+      lines.push(
+        `${idx + 1}. ${r.riskCode || r.id?.slice(0,6) || '-'} | Score: ${s} (${lvl}) | Dept: ${r.department || '-'} | ${r.riskDescription || r.title || '-'}`
+      );
+    });
+
+    const content = lines.join('\n');
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `Executive_Summary_${new Date().toISOString().split('T')[0]}.txt`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  // ======== EXPORT: EXECUTIVE SUMMARY – Word (.docx) ========
+  const exportExecutiveSummaryDOCX = async ({ filteredRisks, filteredTreatments, filteredIncidents, logoBase64 }) => {
+    const {
+      Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType,
+      Table, TableRow, TableCell, WidthType, ImageRun
+    } = await import('docx');
+
+    const total     = filteredRisks.length;
+    const highExtreme = filteredRisks.filter(r => scoreByConfig(r.likelihood ?? r.initialProbability, r.impact ?? r.initialImpact) >= 16).length;
+    const plans     = filteredTreatments.length;
+    const completed = filteredTreatments.filter(p => p.status === 'completed').length;
+    const inci      = filteredIncidents.length;
+    const critical  = filteredIncidents.filter(i => (i.severity || '').toLowerCase() === 'critical').length;
+
+    const distMap = { Extreme: 0, High: 0, Medium: 0, Low: 0 };
+    filteredRisks.forEach(r => { 
+      const s = scoreByConfig(r.likelihood ?? r.initialProbability, r.impact ?? r.initialImpact);
+      distMap[levelByConfig(s).level]++; 
+    });
+
+    const top = [...filteredRisks].sort((a,b)=>{
+      const sb = scoreByConfig(b.likelihood ?? b.initialProbability, b.impact ?? b.initialImpact);
+      const sa = scoreByConfig(a.likelihood ?? a.initialProbability, a.impact ?? a.initialImpact);
+      return sb - sa;
+    }).slice(0,10);
+
+    // Header + Logo
+    const headerElems = [];
+    if (logoBase64) {
+      try {
+        const base64 = logoBase64.split(',')[1];
+        headerElems.push(
+          new Paragraph({
+            alignment: AlignmentType.LEFT,
+            children: [
+              new ImageRun({
+                data: Uint8Array.from(atob(base64), c => c.charCodeAt(0)),
+                transformation: { width: 100, height: 100 },
+              }),
+            ],
+          })
+        );
+      } catch {}
+    }
+    headerElems.push(
+      new Paragraph({
+        alignment: AlignmentType.CENTER,
+        children: [new TextRun({ text: 'EXECUTIVE SUMMARY', bold: true, size: 48 })],
+      }),
+    );
+    headerElems.push(
+      new Paragraph({
+        alignment: AlignmentType.CENTER,
+        children: [new TextRun({ text: 'PT Odira Energy Karang Agung', size: 24 })],
+      }),
+    );
+    headerElems.push(
+      new Paragraph({
+        alignment: AlignmentType.CENTER,
+        children: [new TextRun({ text: `Generated: ${new Date().toLocaleString('id-ID')}`, size: 20 })],
+      }),
+    );
+
+    // Metrics table
+    const metricsTable = new Table({
+      width: { size: 100, type: WidthType.PERCENTAGE },
+      rows: [
+        new TableRow({
+          children: [
+            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: 'Metric', bold: true })] })] }),
+            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: 'Value', bold: true })] })] }),
+          ],
+        }),
+        ...[
+          ['Total Risks', total],
+          ['High & Extreme', highExtreme],
+          ['Treatment Plans', plans],
+          ['Completed Treatments', completed],
+          ['Incidents', inci],
+          ['Critical Incidents', critical],
+        ].map(([k, v]) => new TableRow({
+          children: [
+            new TableCell({ children: [new Paragraph(String(k))] }),
+            new TableCell({ children: [new Paragraph(String(v))] }),
+          ],
+        })),
+      ],
+    });
+
+    // Distribution table
+    const distTable = new Table({
+      width: { size: 100, type: WidthType.PERCENTAGE },
+      rows: [
+        new TableRow({
+          children: [
+            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: 'Level', bold: true })] })] }),
+            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: 'Jumlah', bold: true })] })] }),
+            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: 'Persentase', bold: true })] })] }),
+          ],
+        }),
+        ...Object.entries(distMap).map(([lvl, cnt]) => new TableRow({
+          children: [
+            new TableCell({ children: [new Paragraph(lvl)] }),
+            new TableCell({ children: [new Paragraph(String(cnt))] }),
+            new TableCell({ children: [new Paragraph(`${Math.round((cnt/(total||1))*100)}%`)] }),
+          ],
+        })),
+      ],
+    });
+
+    // Top 10 paragraf
+    const topTitle = new Paragraph({ heading: HeadingLevel.HEADING_2, children: [new TextRun({ text: 'Top 10 Risks by Score', bold: true })] });
+    const topParagraphs = top.map((r, idx) => {
+      const s = scoreByConfig(r.likelihood ?? r.initialProbability, r.impact ?? r.initialImpact);
+      const lvl = levelByConfig(s).level;
+      return new Paragraph({
+        spacing: { after: 120 },
+        children: [
+          new TextRun({ text: `${idx + 1}. `, bold: true }),
+          new TextRun({ text: `${r.riskCode || r.id?.slice(0,6) || '-'}`, bold: true }),
+          new TextRun({ text: ` | Score: ${s} (${lvl}) | Dept: ${r.department || '-'}` }),
+          new TextRun({ text: `\n${r.riskDescription || r.title || '-'}` }),
+        ],
+      });
+    });
+
+    const doc = new Document({
+      sections: [{
+        properties: {},
+        children: [
+          ...headerElems,
+          new Paragraph(''),
+          new Paragraph({ heading: HeadingLevel.HEADING_2, children: [new TextRun({ text: 'Key Metrics', bold: true })] }),
+          metricsTable,
+          new Paragraph(''),
+          new Paragraph({ heading: HeadingLevel.HEADING_2, children: [new TextRun({ text: 'Risk Distribution', bold: true })] }),
+          distTable,
+          new Paragraph(''),
+          topTitle,
+          ...topParagraphs,
+        ],
+      }],
+    });
+
+    const buffer = await Packer.toBlob(doc);
+    saveAs(buffer, `Executive_Summary_${new Date().toISOString().slice(0,10)}.docx`);
+  };
+
+  // ======== EXPORT: TREATMENT PROGRESS – XLSX ========
+  const exportTreatmentProgressXLSX = async (filteredTreatments) => {
+    const ExcelJS = (await import('exceljs')).default;
+    const wb = new ExcelJS.Workbook(); wb.created = new Date();
+    const ws = wb.addWorksheet('Treatment Progress');
+
+    ws.addRow(['Treatment Progress']); ws.getRow(1).font = { bold: true, size: 16 };
+    ws.addRow([]);
+    ws.addRow(['No','Description','Status','Progress','Responsible Person','Treatment Type','Created']);
+    filteredTreatments.forEach((p,i)=>{
+      ws.addRow([i+1, p.treatmentDescription || '-', p.status || '-', `${p.progress || 0}%`,
+        p.responsiblePerson || '-', p.treatmentType || '-', p.createdAt ? fmtDate(p.createdAt) : '-']);
+    });
+
+    const buf = await wb.xlsx.writeBuffer();
+    saveAs(new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
+      `Treatment_Progress_${new Date().toISOString().slice(0,10)}.xlsx`);
+  };
+
+  // ======== EXPORT: INCIDENT REPORT – XLSX ========
+  const exportIncidentReportXLSX = async (filteredIncidents) => {
+    const ExcelJS = (await import('exceljs')).default;
+    const wb = new ExcelJS.Workbook(); wb.created = new Date();
+    const ws = wb.addWorksheet('Incident Report');
+
+    ws.addRow(['Incident Report']); ws.getRow(1).font = { bold: true, size: 16 };
+    ws.addRow([]);
+    ws.addRow(['No','Description','Severity','Status','Reported By','Incident Date']);
+    filteredIncidents.forEach((x,i)=>{
+      ws.addRow([i+1, x.description || '-', x.severity || '-', x.status || '-', x.reportedBy || '-', x.incidentDate ? fmtDate(x.incidentDate) : '-']);
+    });
+
+    const buf = await wb.xlsx.writeBuffer();
+    saveAs(new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
+      `Incident_Report_${new Date().toISOString().slice(0,10)}.xlsx`);
+  };
+
+  // ======== EXPORT: COMPREHENSIVE – XLSX (multi-sheet) ========
+  const exportComprehensiveXLSX = async ({ filteredRisks, filteredTreatments, filteredIncidents }) => {
+    const ExcelJS = (await import('exceljs')).default;
+
+    const wb = new ExcelJS.Workbook();
+    wb.creator = userData?.name || 'ERM System'; wb.created = new Date();
+
+    // Sheet 1: Executive Summary
+    const ws1 = wb.addWorksheet('Executive Summary');
+    const total     = filteredRisks.length;
+    const highExtreme = filteredRisks.filter(r => scoreByConfig(r.likelihood ?? r.initialProbability, r.impact ?? r.initialImpact) >= 16).length;
+    const plans     = filteredTreatments.length;
+    const completed = filteredTreatments.filter(p => p.status === 'completed').length;
+    const inci      = filteredIncidents.length;
+    const critical  = filteredIncidents.filter(i => (i.severity || '').toLowerCase() === 'critical').length;
+
+    ws1.addRow(['Executive Summary']); ws1.getRow(1).font = { bold: true, size: 16 };
+    ws1.addRow([]); ws1.addRow(['Metric','Value']);
+    ws1.addRow(['Total Risks', total]);
+    ws1.addRow(['High & Extreme', highExtreme]);
+    ws1.addRow(['Treatment Plans', plans]);
+    ws1.addRow(['Completed Treatments', completed]);
+    ws1.addRow(['Incidents', inci]);
+    ws1.addRow(['Critical Incidents', critical]);
+
+    ws1.addRow([]); ws1.addRow(['Risk Distribution by Level']); ws1.getRow(ws1.lastRow.number).font = { bold: true, size: 12 };
+    const dist = { Extreme: 0, High: 0, Medium: 0, Low: 0 };
+    filteredRisks.forEach(r => {
+      const s = scoreByConfig(r.likelihood ?? r.initialProbability, r.impact ?? r.initialImpact);
+      dist[levelByConfig(s).level]++; 
+    });
+    ws1.addRow(['Level','Jumlah','Persentase']);
+    Object.entries(dist).forEach(([lvl,cnt]) => ws1.addRow([lvl, cnt, `${Math.round((cnt/(total||1))*100)}%`]));
+
+    // Sheet 2: Risk Register
+    const ws2 = wb.addWorksheet('Risk Register', { views: [{ state: 'frozen', xSplit: 0, ySplit: 1 }] });
+    ws2.addRow([
+      'No','Kode Risiko','Sumber Risiko','Jenis Risiko','Departemen','Nama Risiko',
+      'Deskripsi','Penyebab','Dampak',
+      'Nilai Dampak (Rp)','Nilai & Skala Kemungkinan','Skala Dampak','Nilai risiko','Pengendalian Existing',
+      'Nilai Dampak Residual (Rp)','Skala Kemungkinan','Skala Dampak','Nilai risiko',
+      'Pengendalian Tambahan','Biaya Pengendalian','Pemilik Risiko','PIC'
+    ]);
+    filteredRisks.forEach((r,i)=>{
+      const inherentScore = scoreByConfig(r.initialProbability, r.initialImpact);
+      const residualScore = scoreByConfig(r.residualProbability, r.residualImpact);
+
+      ws2.addRow([
+        i+1, r.riskCode || r.id?.slice(0,6) || '-', r.riskSource || '-', r.riskType || '-', r.department || '-', r.title || r.riskDescription || '-',
+        r.riskDescription || '-', r.cause || '-', r.effect || '-',
+        fmtRp(r.inherentRiskQuantification), r.initialProbability || '', r.initialImpact || '', inherentScore, r.existingControl || '-',
+        fmtRp(r.residualRiskQuantification), r.residualProbability || '', r.residualImpact || '', residualScore,
+        r.additionalControls || '-', fmtRp(r.controlCost), r.riskOwner || '-', r.responsiblePerson || '-',
+      ]);
+    });
+
+    // Sheet 3: Treatment Progress
+    const ws3 = wb.addWorksheet('Treatment Progress');
+    ws3.addRow(['No','Description','Status','Progress','Responsible Person','Treatment Type','Created']);
+    filteredTreatments.forEach((p,i)=> ws3.addRow([i+1, p.treatmentDescription || '-', p.status || '-', `${p.progress || 0}%`, p.responsiblePerson || '-', p.treatmentType || '-', p.createdAt ? fmtDate(p.createdAt) : '-']));
+
+    // Sheet 4: Incident Report
+    const ws4 = wb.addWorksheet('Incident Report');
+    ws4.addRow(['No','Description','Severity','Status','Reported By','Incident Date']);
+    filteredIncidents.forEach((x,i)=> ws4.addRow([i+1, x.description || '-', x.severity || '-', x.status || '-', x.reportedBy || '-', x.incidentDate ? fmtDate(x.incidentDate) : '-']));
+
+    const buf = await wb.xlsx.writeBuffer();
+    saveAs(new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
+      `ERM_Comprehensive_${new Date().toISOString().slice(0,10)}.xlsx`);
+  };
+
+  // ======== HANDLER GENERATE ========
+  const handleGenerateReport = async () => {
     setGenerating(true);
     try {
       const { filteredRisks, filteredTreatments, filteredIncidents } = getFilteredData();
-      
-      // Create comprehensive CSV content
-      let csvContent = 'ERM System - Enterprise Risk Management Report\n\n';
-      
-      // Report header
-      csvContent += `Report Type,${reportTypes.find(t => t.value === reportConfig.reportType)?.label}\n`;
-      csvContent += `Period,${dateRanges.find(d => d.value === reportConfig.dateRange)?.label}\n`;
-      csvContent += `Generated,${new Date().toLocaleString('id-ID')}\n`;
-      csvContent += `Generated By,${userData?.name || 'Unknown User'}\n\n`;
-      
-      // Executive Summary section
-      csvContent += 'EXECUTIVE SUMMARY\n';
-      csvContent += 'Metric,Value\n';
-      csvContent += `Total Risks,${filteredRisks.length}\n`;
-      csvContent += `High & Extreme Risks,${filteredRisks.filter(r => (r.likelihood * r.impact) >= 16).length}\n`;
-      csvContent += `Treatment Plans,${filteredTreatments.length}\n`;
-      csvContent += `Completed Treatments,${filteredTreatments.filter(p => p.status === 'completed').length}\n`;
-      csvContent += `Incidents Reported,${filteredIncidents.length}\n`;
-      csvContent += `Critical Incidents,${filteredIncidents.filter(i => i.severity === 'critical').length}\n\n`;
+      const t = reportConfig.reportType;
+      const f = reportConfig.format;
 
-      // Risks section - DIPERBAIKI dengan semua field
-      if (filteredRisks.length > 0 && (reportConfig.reportType === 'risk_register' || reportConfig.reportType === 'comprehensive')) {
-        csvContent += 'RISK REGISTER - LENGKAP\n';
-        // Header dengan semua field dari form input
-        csvContent += 'No,Kode Risiko,Judul Risiko,Deskripsi Risiko,Departemen,Tipe Risiko,Sumber Risiko,Penyebab,Dampak,Likelihood,Impact,Score,Level,Klasifikasi,Pemilik Risiko,Existing Control,Status,Tanggal Identifikasi,Target Penyelesaian,Progress,Komentar,Dibuat Oleh,Tanggal Dibuat\n';
-        
-        filteredRisks.forEach((risk, index) => {
-          const score = (risk.likelihood || 1) * (risk.impact || 1);
-          const level = score >= 20 ? 'Extreme' : score >= 16 ? 'High' : score >= 10 ? 'Medium' : 'Low';
-          
-          // Format data untuk menghindari issue CSV
-          const formatCSVValue = (value) => {
-            if (value === null || value === undefined) return '';
-            const stringValue = String(value);
-            // Escape quotes dan handle comma
-            return `"${stringValue.replace(/"/g, '""')}"`;
-          };
+      // Validasi data per tipe
+      if (t === 'risk_register'        && filteredRisks.length      === 0) { showSnackbar('Risk kosong untuk filter ini.', 'warning'); return; }
+      if (t === 'treatment_progress'   && filteredTreatments.length === 0) { showSnackbar('Treatment kosong untuk filter ini.', 'warning'); return; }
+      if (t === 'incident_report'      && filteredIncidents.length  === 0) { showSnackbar('Incident kosong untuk filter ini.', 'warning'); return; }
 
-          csvContent += 
-            `${index + 1},` +
-            `${formatCSVValue(risk.riskCode)},` +
-            `${formatCSVValue(risk.title)},` +
-            `${formatCSVValue(risk.riskDescription)},` +
-            `${formatCSVValue(risk.department)},` +
-            `${formatCSVValue(risk.riskType)},` +
-            `${formatCSVValue(risk.riskSource)},` +
-            `${formatCSVValue(risk.cause)},` +
-            `${formatCSVValue(risk.effect)},` +
-            `${risk.likelihood || 1},` +
-            `${risk.impact || 1},` +
-            `${score},` +
-            `${level},` +
-            `${formatCSVValue(risk.classification)},` +
-            `${formatCSVValue(risk.riskOwner)},` +
-            `${formatCSVValue(risk.existingControl)},` +
-            `${formatCSVValue(risk.status)},` +
-            `${formatCSVValue(risk.identificationDate?.toLocaleDateString('id-ID'))},` +
-            `${formatCSVValue(risk.targetDate?.toLocaleDateString('id-ID'))},` +
-            `${formatCSVValue(risk.progress)}%,` +
-            `${formatCSVValue(risk.comments)},` +
-            `${formatCSVValue(risk.createdBy)},` +
-            `${formatCSVValue(risk.createdAt?.toLocaleDateString('id-ID'))}\n`;
-        });
-        csvContent += '\n';
+      if (t === 'risk_register') {
+        if (f === 'pdf')      await exportRiskRegisterPDF(filteredRisks);
+        if (f === 'excel')    await exportRiskRegisterXLSX(filteredRisks);
+        if (f === 'word')     showSnackbar('Format Word tidak tersedia untuk Risk Register. Gunakan PDF/Excel.', 'info');
+        if (f === 'text')     showSnackbar('Format Text tidak tersedia untuk Risk Register. Gunakan PDF/Excel.', 'info');
+      } else if (t === 'executive_summary') {
+        if (f === 'pdf')      await exportExecutiveSummaryPDF({ filteredRisks, filteredTreatments, filteredIncidents });
+        if (f === 'excel')    await exportExecutiveSummaryXLSX({ filteredRisks, filteredTreatments, filteredIncidents });
+        if (f === 'word')     await exportExecutiveSummaryDOCX({ filteredRisks, filteredTreatments, filteredIncidents, logoBase64: LOGO_BASE64 });
+        if (f === 'text')     exportExecutiveSummaryTXT({ filteredRisks, filteredTreatments, filteredIncidents });
+      } else if (t === 'treatment_progress') {
+        if (f === 'excel')    await exportTreatmentProgressXLSX(filteredTreatments);
+        if (f === 'pdf' || f === 'word' || f === 'text') showSnackbar('Gunakan Excel untuk Treatment Progress.', 'info');
+      } else if (t === 'incident_report') {
+        if (f === 'excel')    await exportIncidentReportXLSX(filteredIncidents);
+        if (f === 'pdf' || f === 'word' || f === 'text') showSnackbar('Gunakan Excel untuk Incident Report.', 'info');
+      } else if (t === 'comprehensive') {
+        if (f === 'excel')    await exportComprehensiveXLSX({ filteredRisks, filteredTreatments, filteredIncidents });
+        if (f === 'pdf' || f === 'word' || f === 'text') showSnackbar('Comprehensive tersedia sebagai Excel multi-sheet.', 'info');
       }
 
-      // Treatment plans section
-      if (filteredTreatments.length > 0 && (reportConfig.reportType === 'treatment_progress' || reportConfig.reportType === 'comprehensive')) {
-        csvContent += 'TREATMENT PLANS\n';
-        csvContent += 'No,Description,Status,Progress,Responsible Person,Treatment Type\n';
-        filteredTreatments.forEach((plan, index) => {
-          csvContent += `${index + 1},"${plan.treatmentDescription}","${plan.status}",${plan.progress || 0}%,"${plan.responsiblePerson || ''}","${plan.treatmentType || ''}"\n`;
-        });
-        csvContent += '\n';
-      }
-
-      // Incidents section
-      if (filteredIncidents.length > 0 && (reportConfig.reportType === 'incident_report' || reportConfig.reportType === 'comprehensive')) {
-        csvContent += 'INCIDENT REPORTS\n';
-        csvContent += 'No,Description,Severity,Status,Reported By,Incident Date\n';
-        filteredIncidents.forEach((incident, index) => {
-          csvContent += `${index + 1},"${incident.description}","${incident.severity}","${incident.status}","${incident.reportedBy || ''}","${incident.incidentDate.toLocaleDateString('id-ID')}"\n`;
-        });
-      }
-
-      // Create and download CSV
-      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = `ERM_Report_${reportConfig.reportType}_${new Date().toISOString().split('T')[0]}.csv`;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      
-      showSnackbar('Excel report berhasil di-generate dengan data lengkap!', 'success');
+      showSnackbar(`Export ${t.replace('_',' ').toUpperCase()} (${f.toUpperCase()}) berhasil.`, 'success');
     } catch (error) {
-      console.error('❌ Error generating Excel:', error);
-      showSnackbar('Error generating Excel report: ' + error.message, 'error');
+      console.error(error);
+      showSnackbar('Error saat export: ' + error.message, 'error');
     } finally {
       setGenerating(false);
     }
   };
 
-  // Handle report generation
-  const handleGenerateReport = () => {
-    if (reportConfig.format === 'pdf') {
-      generatePDF();
-    } else {
-      generateExcel();
-    }
-  };
+  // ======== UI ========
+  const reportTypes = [
+    { value: 'executive_summary', label: 'Executive Summary', icon: <Analytics /> },
+    { value: 'risk_register',     label: 'Risk Register',     icon: <Warning /> },
+    { value: 'treatment_progress',label: 'Treatment Progress',icon: <Assignment /> },
+    { value: 'incident_report',   label: 'Incident Report',   icon: <Warning /> },
+    { value: 'comprehensive',     label: 'Comprehensive Report', icon: <TableChart /> },
+  ];
 
-  // Schedule report
-  const handleScheduleReport = async () => {
-    try {
-      // Simulate scheduling
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      showSnackbar('Report scheduling berhasil!', 'success');
-      setScheduleDialog(false);
-    } catch (error) {
-      showSnackbar('Error scheduling report: ' + error.message, 'error');
-    }
-  };
+  const dateRanges = [
+    { value: 'last_week',    label: 'Minggu Lalu' },
+    { value: 'last_month',   label: 'Bulan Lalu' },
+    { value: 'last_quarter', label: 'Kuartal Lalu' },
+    { value: 'last_year',    label: 'Tahun Lalu' },
+    { value: 'all_time',     label: 'Semua Data' },
+  ];
 
-  // Snackbar handler
-  const showSnackbar = (message, severity) => {
-    setSnackbar({ open: true, message, severity });
-  };
-
-  const handleCloseSnackbar = () => {
-    setSnackbar({ ...snackbar, open: false });
-  };
-
-  // Statistics untuk preview
   const { filteredRisks, filteredTreatments, filteredIncidents } = getFilteredData();
-  
   const stats = {
     totalRisks: filteredRisks.length,
-    highRisks: filteredRisks.filter(risk => {
-      const score = (risk.likelihood || 1) * (risk.impact || 1);
-      return score >= 16;
-    }).length,
+    highRisks: filteredRisks.filter(r => scoreByConfig(r.likelihood ?? r.initialProbability, r.impact ?? r.initialImpact) >= 16).length,
     totalTreatments: filteredTreatments.length,
-    completedTreatments: filteredTreatments.filter(plan => plan.status === 'completed').length,
+    completedTreatments: filteredTreatments.filter(p => p.status === 'completed').length,
     totalIncidents: filteredIncidents.length,
-    criticalIncidents: filteredIncidents.filter(incident => incident.severity === 'critical').length
+    criticalIncidents: filteredIncidents.filter(i => (i.severity || '').toLowerCase() === 'critical').length
   };
-  
+
   if (loading) {
     return (
       <Box sx={{ p: 3, display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '400px' }}>
         <CircularProgress />
-        <Typography variant="h6" sx={{ ml: 2 }}>
-          Loading Reporting System...
-        </Typography>
+        <Typography variant="h6" sx={{ ml: 2 }}>Loading Reporting System...</Typography>
       </Box>
     );
   }
@@ -675,40 +1154,29 @@ const Reporting = () => {
       {/* Header */}
       <Card sx={{ mb: 3, boxShadow: 3 }}>
         <CardContent>
-          <Box display="flex" justifyContent="space-between" alignItems="center">
-            <Box display="flex" alignItems="center" gap={3}>
-              <Box sx={{ 
-                p: 2, 
-                backgroundColor: 'primary.main', 
-                borderRadius: 2,
-                color: 'white'
-              }}>
-                <PictureAsPdf sx={{ fontSize: 40 }} />
-              </Box>
-              <Box>
-                <Typography variant="h4" fontWeight="bold" gutterBottom>
-                  Reporting System
-                </Typography>
-                <Typography variant="subtitle1" color="textSecondary">
-                  Generate laporan risiko untuk Direksi & Dewan Komisaris
-                </Typography>
-                <Typography variant="body2" color="textSecondary">
-                  Data terkini: {risks.length} Risks, {treatmentPlans.length} Treatments, {incidents.length} Incidents
-                </Typography>
-              </Box>
+          <Box display="flex" alignItems="center" gap={3}>
+            <Box sx={{ p: 2, backgroundColor: 'primary.main', borderRadius: 2, color: 'white' }}>
+              <PictureAsPdf sx={{ fontSize: 40 }} />
+            </Box>
+            <Box>
+              <Typography variant="h4" fontWeight="bold">Reporting System</Typography>
+              <Typography variant="subtitle1" color="textSecondary">
+                Generate laporan risiko untuk Direksi & Dewan Komisaris
+              </Typography>
+              <Typography variant="body2" color="textSecondary">
+                Data terkini: {risks.length} Risks, {treatmentPlans.length} Treatments, {incidents.length} Incidents
+              </Typography>
             </Box>
           </Box>
         </CardContent>
       </Card>
 
       <Grid container spacing={3}>
-        {/* Report Configuration */}
+        {/* Config */}
         <Grid item xs={12} md={4}>
           <Card sx={{ boxShadow: 3, height: 'fit-content' }}>
             <CardContent>
-              <Typography variant="h6" fontWeight="bold" gutterBottom>
-                Report Configuration
-              </Typography>
+              <Typography variant="h6" fontWeight="bold" gutterBottom>Report Configuration</Typography>
 
               <Grid container spacing={2} sx={{ mt: 1 }}>
                 <Grid item xs={12}>
@@ -741,14 +1209,22 @@ const Reporting = () => {
                     >
                       <MenuItem value="pdf">
                         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                          <PictureAsPdf />
-                          PDF Document
+                          <PictureAsPdf /> PDF Document
                         </Box>
                       </MenuItem>
                       <MenuItem value="excel">
                         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                          <TableChart />
-                          Excel/CSV
+                          <TableChart /> Excel (.xlsx)
+                        </Box>
+                      </MenuItem>
+                      <MenuItem value="word">
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                          <Assignment /> Word (.docx)
+                        </Box>
+                      </MenuItem>
+                      <MenuItem value="text">
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                          <Assignment /> Text (.txt)
                         </Box>
                       </MenuItem>
                     </Select>
@@ -790,9 +1266,7 @@ const Reporting = () => {
 
                 <Grid item xs={12}>
                   <Button
-                    variant="contained"
-                    fullWidth
-                    size="large"
+                    variant="contained" fullWidth size="large"
                     startIcon={reportConfig.format === 'pdf' ? <PictureAsPdf /> : <TableChart />}
                     onClick={handleGenerateReport}
                     disabled={generating}
@@ -804,8 +1278,7 @@ const Reporting = () => {
 
                 <Grid item xs={12}>
                   <Button
-                    variant="outlined"
-                    fullWidth
+                    variant="outlined" fullWidth
                     startIcon={<Schedule />}
                     onClick={() => setScheduleDialog(true)}
                   >
@@ -815,69 +1288,30 @@ const Reporting = () => {
               </Grid>
             </CardContent>
           </Card>
-
-          {/* Report Preview */}
-          <Card sx={{ boxShadow: 3, mt: 3 }}>
-            <CardContent>
-              <Typography variant="h6" fontWeight="bold" gutterBottom>
-                Report Preview
-              </Typography>
-              
-              <Box sx={{ mt: 2 }}>
-                <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 1 }}>
-                  <Typography variant="body2">Total Risks:</Typography>
-                  <Typography variant="body2" fontWeight="bold">{stats.totalRisks}</Typography>
-                </Box>
-                <Box sx={{ display: 'flex', justifyContent:'space-between', mb: 1 }}>
-                  <Typography variant="body2">High Risks:</Typography>
-                  <Typography variant="body2" fontWeight="bold" color="error.main">{stats.highRisks}</Typography>
-                </Box>
-                <Box sx={{ display: 'flex', justifyContent:'space-between', mb: 1 }}>
-                  <Typography variant="body2">Treatment Plans:</Typography>
-                  <Typography variant="body2" fontWeight="bold">{stats.totalTreatments}</Typography>
-                </Box>
-                <Box sx={{ display: 'flex', justifyContent:'space-between', mb: 1 }}>
-                  <Typography variant="body2">Completed Treatments:</Typography>
-                  <Typography variant="body2" fontWeight="bold" color="success.main">{stats.completedTreatments}</Typography>
-                </Box>
-                <Box sx={{ display: 'flex', justifyContent:'space-between' }}>
-                  <Typography variant="body2">Incidents:</Typography>
-                  <Typography variant="body2" fontWeight="bold">{stats.totalIncidents}</Typography>
-                </Box>
-              </Box>
-            </CardContent>
-          </Card>
         </Grid>
 
-        {/* Report Templates */}
+        {/* Templates & Data Preview */}
         <Grid item xs={12} md={8}>
           <Card sx={{ boxShadow: 3 }}>
             <CardContent>
-              <Typography variant="h6" fontWeight="bold" gutterBottom>
-                Available Report Templates
-              </Typography>
+              <Typography variant="h6" fontWeight="bold" gutterBottom>Available Report Templates</Typography>
 
               <Grid container spacing={2} sx={{ mt: 1 }}>
                 {reportTypes.map((template) => (
                   <Grid item xs={12} key={template.value}>
-                    <Paper 
-                      variant="outlined" 
-                      sx={{ 
-                        p: 2, 
-                        cursor: 'pointer',
+                    <Paper
+                      variant="outlined"
+                      sx={{
+                        p: 2, cursor: 'pointer',
                         border: reportConfig.reportType === template.value ? 2 : 1,
                         borderColor: reportConfig.reportType === template.value ? 'primary.main' : 'divider',
                         backgroundColor: reportConfig.reportType === template.value ? 'primary.light' : 'background.paper',
-                        '&:hover': {
-                          backgroundColor: 'action.hover',
-                        }
+                        '&:hover': { backgroundColor: 'action.hover' },
                       }}
                       onClick={() => setReportConfig({ ...reportConfig, reportType: template.value })}
                     >
                       <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
-                        <Box sx={{ color: 'primary.main' }}>
-                          {template.icon}
-                        </Box>
+                        <Box sx={{ color: 'primary.main' }}>{template.icon}</Box>
                         <Box sx={{ flexGrow: 1 }}>
                           <Typography variant="subtitle1" fontWeight="bold">
                             {template.label}
@@ -886,11 +1320,7 @@ const Reporting = () => {
                             {getTemplateDescription(template.value)}
                           </Typography>
                         </Box>
-                        <Chip 
-                          label="PDF/Excel" 
-                          size="small" 
-                          variant="outlined" 
-                        />
+                        <Chip label="PDF/Excel/Word/Text" size="small" variant="outlined" />
                       </Box>
                     </Paper>
                   </Grid>
@@ -899,19 +1329,19 @@ const Reporting = () => {
             </CardContent>
           </Card>
 
-          {/* Recent Data Preview */}
+          {/* Data Preview (Risks) */}
           <Card sx={{ boxShadow: 3, mt: 3 }}>
             <CardContent>
               <Typography variant="h6" fontWeight="bold" gutterBottom>
                 Data Preview ({filteredRisks.length} risks)
               </Typography>
-              
+
               {filteredRisks.length === 0 ? (
                 <Alert severity="info" sx={{ mt: 2 }}>
                   No data available for selected filters.
                 </Alert>
               ) : (
-                <TableContainer component={Paper} variant="outlined" sx={{ mt: 2, maxHeight: 400 }}>
+                <TableContainer component={Paper} variant="outlined" sx={{ mt: 2, maxHeight: 420 }}>
                   <Table size="small" stickyHeader>
                     <TableHead>
                       <TableRow sx={{ backgroundColor: 'grey.100' }}>
@@ -927,10 +1357,9 @@ const Reporting = () => {
                     </TableHead>
                     <TableBody>
                       {filteredRisks.slice(0, 10).map((risk) => {
-                        const score = (risk.likelihood || 1) * (risk.impact || 1);
-                        const level = score >= 20 ? 'Extreme' : score >= 16 ? 'High' : score >= 10 ? 'Medium' : 'Low';
-                        const color = score >= 20 ? 'error' : score >= 16 ? 'warning' : score >= 10 ? 'info' : 'success';
-                        
+                        const s = scoreByConfig(risk.likelihood ?? risk.initialProbability, risk.impact ?? risk.initialImpact);
+                        const lvl = levelByConfig(s).level;
+                        const color = lvl === 'Extreme' || lvl === 'High' ? 'error' : (lvl === 'Medium' ? 'warning' : 'success');
                         return (
                           <TableRow key={risk.id} hover>
                             <TableCell>
@@ -939,44 +1368,19 @@ const Reporting = () => {
                               </Typography>
                             </TableCell>
                             <TableCell>
-                              <Typography variant="body2" sx={{ 
-                                display: '-webkit-box',
-                                WebkitLineClamp: 2,
-                                WebkitBoxOrient: 'vertical',
-                                overflow: 'hidden'
+                              <Typography variant="body2" sx={{
+                                display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden'
                               }}>
                                 {risk.title}
                               </Typography>
                             </TableCell>
+                            <TableCell align="center"><Typography variant="caption">{risk.department || '-'}</Typography></TableCell>
+                            <TableCell align="center"><Typography variant="body2">{risk.likelihood ?? risk.initialProbability ?? '-'}</Typography></TableCell>
+                            <TableCell align="center"><Typography variant="body2">{risk.impact ?? risk.initialImpact ?? '-'}</Typography></TableCell>
+                            <TableCell align="center"><Typography variant="body2" fontWeight="bold">{s}</Typography></TableCell>
+                            <TableCell align="center"><Chip label={lvl} color={color} size="small" /></TableCell>
                             <TableCell align="center">
-                              <Typography variant="caption">
-                                {risk.department || '-'}
-                              </Typography>
-                            </TableCell>
-                            <TableCell align="center">
-                              <Typography variant="body2">{risk.likelihood}</Typography>
-                            </TableCell>
-                            <TableCell align="center">
-                              <Typography variant="body2">{risk.impact}</Typography>
-                            </TableCell>
-                            <TableCell align="center">
-                              <Typography variant="body2" fontWeight="bold">
-                                {score}
-                              </Typography>
-                            </TableCell>
-                            <TableCell align="center">
-                              <Chip 
-                                label={level} 
-                                color={color} 
-                                size="small"
-                              />
-                            </TableCell>
-                            <TableCell align="center">
-                              <Chip 
-                                label={risk.status || 'Identified'} 
-                                size="small"
-                                variant="outlined"
-                              />
+                              <Chip label={risk.status || 'Identified'} size="small" variant="outlined" />
                             </TableCell>
                           </TableRow>
                         );
@@ -990,9 +1394,9 @@ const Reporting = () => {
         </Grid>
       </Grid>
 
-      {/* Schedule Report Dialog */}
-      <Dialog 
-        open={scheduleDialog} 
+      {/* Schedule Dialog */}
+      <Dialog
+        open={scheduleDialog}
         onClose={() => setScheduleDialog(false)}
         maxWidth="sm"
         fullWidth
@@ -1003,11 +1407,7 @@ const Reporting = () => {
             <Grid item xs={12}>
               <FormControl fullWidth>
                 <InputLabel>Frequency</InputLabel>
-                <Select
-                  value={scheduleConfig.frequency}
-                  label="Frequency"
-                  onChange={(e) => setScheduleConfig({ ...scheduleConfig, frequency: e.target.value })}
-                >
+                <Select value={'monthly'} label="Frequency" onChange={() => {}}>
                   <MenuItem value="weekly">Weekly</MenuItem>
                   <MenuItem value="monthly">Monthly</MenuItem>
                   <MenuItem value="quarterly">Quarterly</MenuItem>
@@ -1016,42 +1416,9 @@ const Reporting = () => {
             </Grid>
 
             <Grid item xs={12}>
-              <FormControl fullWidth>
-                <InputLabel>Report Type</InputLabel>
-                <Select
-                  value={scheduleConfig.reportType}
-                  label="Report Type"
-                  onChange={(e) => setScheduleConfig({ ...scheduleConfig, reportType: e.target.value })}
-                >
-                  {reportTypes.map((type) => (
-                    <MenuItem key={type.value} value={type.value}>
-                      {type.label}
-                    </MenuItem>
-                  ))}
-                </Select>
-              </FormControl>
-            </Grid>
-
-            <Grid item xs={12}>
-              <FormControl fullWidth>
-                <InputLabel>Format</InputLabel>
-                <Select
-                  value={scheduleConfig.format}
-                  label="Format"
-                  onChange={(e) => setScheduleConfig({ ...scheduleConfig, format: e.target.value })}
-                >
-                  <MenuItem value="pdf">PDF</MenuItem>
-                  <MenuItem value="excel">Excel</MenuItem>
-                </Select>
-              </FormControl>
-            </Grid>
-
-            <Grid item xs={12}>
               <TextField
                 fullWidth
                 label="Recipients (Email)"
-                value={scheduleConfig.recipients}
-                onChange={(e) => setScheduleConfig({ ...scheduleConfig, recipients: e.target.value })}
                 placeholder="email1@company.com, email2@company.com"
                 helperText="Pisahkan multiple emails dengan koma"
               />
@@ -1060,9 +1427,7 @@ const Reporting = () => {
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setScheduleDialog(false)}>Cancel</Button>
-          <Button variant="contained" onClick={handleScheduleReport}>
-            Schedule Report
-          </Button>
+          <Button variant="contained" onClick={() => setScheduleDialog(false)}>Schedule Report</Button>
         </DialogActions>
       </Dialog>
 
@@ -1073,25 +1438,20 @@ const Reporting = () => {
         onClose={handleCloseSnackbar}
         anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
       >
-        <Alert 
-          onClose={handleCloseSnackbar} 
-          severity={snackbar.severity} 
-          sx={{ width: '100%' }}
-        >
+        <Alert onClose={handleCloseSnackbar} severity={snackbar.severity} sx={{ width: '100%' }}>
           {snackbar.message}
         </Alert>
       </Snackbar>
     </Box>
   );
 
-  // Helper function untuk template descriptions
   function getTemplateDescription(type) {
     const descriptions = {
-      executive_summary: 'High-level overview untuk Direksi dengan key metrics dan trends',
-      risk_register: 'Daftar LENGKAP semua risiko dengan semua field dari form input',
-      treatment_progress: 'Status dan progress treatment plans',
-      incident_report: 'Laporan kejadian risiko yang terjadi',
-      comprehensive: 'Laporan komprehensif semua aspek risk management dengan data lengkap'
+      executive_summary: 'Ringkasan metrik, distribusi level, dan Top 10—skor taat konfigurasi.',
+      risk_register: 'Daftar risiko lengkap dengan grup Inheren & Residual (termasuk nilai dampak Rp).',
+      treatment_progress: 'Status dan progress treatment plans.',
+      incident_report: 'Laporan kejadian risiko.',
+      comprehensive: 'Workbook multi-sheet: Executive, Risk Register, Treatment, Incident.',
     };
     return descriptions[type] || 'Standard report template';
   }
